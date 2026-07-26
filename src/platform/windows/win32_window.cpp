@@ -10,17 +10,20 @@ NativeWindow::NativeWindow(
     const WindowConfig& config,
     RawMessageCallback on_message,
     InitCallback on_init,
-    CloseRequestedCallback on_close_requested
+    CloseRequestedCallback on_close_requested,
+    FatalErrorCallback on_fatal_error
 )
     : config_(config),
       on_message_(std::move(on_message)),
       on_init_(std::move(on_init)),
       on_close_requested_(std::move(on_close_requested)),
+      on_fatal_error_(std::move(on_fatal_error)),
       win_state_(std::make_shared<WindowAsyncState>()),
       ui_thread_id_(GetCurrentThreadId()) {
     win_state_->config = config_;
     win_state_->on_init = on_init_;
     win_state_->on_close_requested = on_close_requested_;
+    win_state_->on_fatal_error = on_fatal_error_;
     win_state_->ui_thread_id = ui_thread_id_;
 }
 
@@ -222,9 +225,13 @@ bool NativeWindow::initialize() {
                 return;
             }
 
-            // The app is already running. Request application-owned deferred shutdown instead of trying to reuse completed init gate.
-            if (state->on_close_requested) {
-                state->on_close_requested();
+            // The app is already running. Report a distinct fatal platform error;
+            // AppImpl owns the resulting shutdown and nonzero exit status.
+            if (state->on_fatal_error) {
+                state->on_fatal_error(
+                    security_hr,
+                    "WebView2 navigation security enforcement failed after readiness."
+                );
             }
         }
     );

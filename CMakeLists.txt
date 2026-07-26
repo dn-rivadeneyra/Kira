@@ -9,6 +9,10 @@ if(MSVC)
     add_compile_options(/FS)
 endif()
 
+if(NOT WIN32)
+    message(FATAL_ERROR "Kira currently supports Windows only.\nThe platform boundary is prepared for future macOS and Linux backends.")
+endif()
+
 # Dependencies setup
 include(cmake/Dependencies.cmake)
 
@@ -41,42 +45,38 @@ if(MSVC)
 endif()
 
 # 2. Native Platform Backend Library
-if(WIN32)
-    add_library(kira_platform STATIC
-        src/platform/platform_factory.cpp
-        src/platform/windows/windows_app_host.cpp
-        src/platform/windows/win32_window.cpp
-        src/platform/windows/webview_transport.cpp
-        src/platform/windows/security.cpp
-        src/platform/windows/string_utils.cpp
-    )
+add_library(kira_platform STATIC
+    src/platform/platform_factory.cpp
+    src/platform/windows/windows_app_host.cpp
+    src/platform/windows/win32_window.cpp
+    src/platform/windows/webview_transport.cpp
+    src/platform/windows/security.cpp
+    src/platform/windows/string_utils.cpp
+)
 
-    target_include_directories(kira_platform PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
+target_include_directories(kira_platform PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 
-    target_include_directories(kira_platform PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${WEBVIEW2_INCLUDE_DIR}
-    )
+target_include_directories(kira_platform PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${WEBVIEW2_INCLUDE_DIR}
+)
 
-    target_link_libraries(kira_platform PUBLIC
-        kira_core
-        "${WEBVIEW2_LIB_DIR}/WebView2Loader.dll.lib"
-        user32
-        ole32
-        shlwapi
-        dwmapi
-        urlmon
-    )
+target_link_libraries(kira_platform PUBLIC
+    kira_core
+    "${WEBVIEW2_LIB_DIR}/WebView2Loader.dll.lib"
+    user32
+    ole32
+    shlwapi
+    dwmapi
+    urlmon
+)
 
-    target_compile_features(kira_platform PUBLIC cxx_std_23)
+target_compile_features(kira_platform PUBLIC cxx_std_23)
 
-    if(MSVC)
-        target_compile_options(kira_platform PRIVATE /W4 /permissive- /utf-8 /FS)
-    endif()
-else()
-    message(FATAL_ERROR "Kira currently supports Windows only.\nThe platform boundary is prepared for future macOS and Linux backends.")
+if(MSVC)
+    target_compile_options(kira_platform PRIVATE /W4 /permissive- /utf-8 /FS)
 endif()
 
 # 3. Public Kira Library Target

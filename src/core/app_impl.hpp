@@ -53,6 +53,7 @@ public:
                     pipeline_.set_ready(true);
                     host_->show();
                 } else {
+                    terminal_exit_code_.store(-1);
                     state_ = ReadinessState::failed;
                     std::cerr << "[Kira Error] Platform initialization failed: " << result.diagnostic << std::endl;
                     shutdown();
@@ -62,6 +63,7 @@ public:
                 shutdown();
             },
             [this](platform::PlatformResult fatal_error) {
+                terminal_exit_code_.store(-1);
                 std::cerr << "[Kira Error] Fatal platform error: " << fatal_error.diagnostic << std::endl;
                 shutdown();
             }
@@ -73,8 +75,9 @@ public:
             return -1;
         }
 
+        const int terminal_code = terminal_exit_code_.load();
         shutdown();
-        return exit_code;
+        return terminal_code != 0 ? terminal_code : exit_code;
     }
 
     void shutdown() {
@@ -112,6 +115,7 @@ private:
     std::unique_ptr<platform::AppHost> host_;
     std::atomic<ReadinessState> state_{ReadinessState::created};
     platform::PlatformResult init_result_;
+    std::atomic<int> terminal_exit_code_{0};
     ShutdownGate shutdown_gate_;
     AppShutdownCoordinator coordinator_;
     CommandRegistry registry_;

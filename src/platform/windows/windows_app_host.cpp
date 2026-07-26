@@ -10,6 +10,28 @@ WindowsAppHost::~WindowsAppHost() {
     request_close();
 }
 
+void WindowsAppHost::complete_readiness(PlatformResult result) {
+    if (readiness_reported_.exchange(true)) {
+        return;
+    }
+
+    is_ready_.store(result.ok());
+    if (on_ready_) {
+        on_ready_(std::move(result));
+    }
+}
+
+void WindowsAppHost::report_fatal(PlatformResult result) {
+    if (fatal_reported_.exchange(true)) {
+        return;
+    }
+
+    is_ready_.store(false);
+    if (on_fatal_error_) {
+        on_fatal_error_(std::move(result));
+    }
+}
+
 void WindowsAppHost::start(
     RawMessageCallback on_message,
     ReadyCallback on_ready,
@@ -33,19 +55,12 @@ void WindowsAppHost::start(
             }
         },
         [this](bool success) {
-            if (success) {
-                is_ready_ = true;
-                if (on_ready_) {
-                    on_ready_(PlatformResult{});
-                }
-            } else {
-                if (on_ready_) {
-                    on_ready_(PlatformResult{
-                        PlatformError::bootstrap_failed,
-                        "WebView2 initialization or navigation failed."
-                    });
-                }
-            }
+            complete_readiness(success
+                ? PlatformResult{}
+                : PlatformResult{
+                    PlatformError::bootstrap_failed,
+                    "WebView2 initialization or navigation failed."
+                });
         },
         [this]() {
             if (window_ && window_->get_hwnd()) {
@@ -57,16 +72,21 @@ void WindowsAppHost::start(
             } else {
                 PostThreadMessage(GetCurrentThreadId(), WM_KIRA_APP_SHUTDOWN, 0, 0);
             }
+        },
+        [this](HRESULT hr, std::string diagnostic) {
+            diagnostic += " HRESULT=" + std::to_string(static_cast<long long>(hr));
+            report_fatal(PlatformResult{
+                PlatformError::security_failure,
+                std::move(diagnostic)
+            });
         }
     );
 
     if (!window_->initialize()) {
-        if (on_ready_) {
-            on_ready_(PlatformResult{
-                PlatformError::window_creation_failed,
-                "Native window initialization failed."
-            });
-        }
+        complete_readiness(PlatformResult{
+            PlatformError::window_creation_failed,
+            "Native window initialization failed."
+        });
     }
 }
 
@@ -97,19 +117,34 @@ void WindowsAppHost::request_close() {
 }
 
 int WindowsAppHost::run_event_loop() {
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_KIRA_APP_SHUTDOWN) {
-            if (on_close_requested_) {
-                on_close_requested_();
+    MSG msg{};
+    while (true) {
+        const BOOL result = GetMessage(&msg, nullptr, 0, 0);
+
+        if (result > 0) {
+            if (msg.message == WM_KIRA_APP_SHUTDOWN) {
+                if (on_close_requested_) {
+                    on_close_requested_();
+                }
+                continue;
             }
+
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
             continue;
         }
 
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        if (result == 0) {
+            return static_cast<int>(msg.wParam);
+        }
+
+        const DWORD error = GetLastError();
+        report_fatal(PlatformResult{
+            PlatformError::event_loop_failed,
+            "GetMessage failed with Win32 error " + std::to_string(error)
+        });
+        return -1;
     }
-    return static_cast<int>(msg.wParam);
 }
 
 } // namespace kira::platform

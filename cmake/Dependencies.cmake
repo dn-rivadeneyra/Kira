@@ -22,7 +22,7 @@ else()
         webview2_sdk
         URL https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-        TLS_VERIFY OFF
+        TLS_VERIFY ON
     )
 endif()
 FetchContent_MakeAvailable(webview2_sdk)

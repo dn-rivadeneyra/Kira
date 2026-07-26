@@ -29,6 +29,7 @@ struct WindowAsyncState {
     WindowConfig config;
     std::function<void(bool success)> on_init;
     std::function<void()> on_close_requested;
+    std::function<void(HRESULT, std::string)> on_fatal_error;
     InitializationGate init_gate;
     EventRegistrationToken nav_completed_token{};
     std::atomic<bool> closed{false};
@@ -66,12 +67,14 @@ public:
     using RawMessageCallback     = std::function<void(const std::string&)>;
     using InitCallback           = std::function<void(bool success)>;
     using CloseRequestedCallback = std::function<void()>;
+    using FatalErrorCallback     = std::function<void(HRESULT, std::string)>;
 
     NativeWindow(
         const WindowConfig& config,
         RawMessageCallback on_message,
         InitCallback on_init,
-        CloseRequestedCallback on_close_requested
+        CloseRequestedCallback on_close_requested,
+        FatalErrorCallback on_fatal_error
     );
 
     ~NativeWindow();
@@ -104,6 +107,7 @@ private:
     RawMessageCallback on_message_;
     InitCallback on_init_;
     CloseRequestedCallback on_close_requested_;
+    FatalErrorCallback on_fatal_error_;
     HWND hwnd_{nullptr};
 
     std::shared_ptr<WebViewTransport> transport_;

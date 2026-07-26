@@ -14,11 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added concrete `WindowsAppHost` (`src/platform/windows/windows_app_host.hpp` / `src/platform/windows/windows_app_host.cpp`) owning Win32 message loop, `NativeWindow`, `WebViewTransport`, and security failure routing.
 - Added platform-independent unit test suite `test_app_host.cpp` exercising `AppImpl` coordination with a fake `AppHost`.
 
-### Changed
-- Refactored `AppImpl` (`src/core/app_impl.hpp` / `src/core/app.cpp`) to depend exclusively on `kira::platform::AppHost`, eliminating all Win32, COM, WebView2, `HRESULT`, `HWND`, and Windows message types from core files.
-- Separated CMake build targets into `kira_core` (platform-independent core), `kira_platform` (native backend), and `kira` (public library).
-- Configured CMake build system to fail cleanly with explicit error message on non-Windows platforms.
-- Updated `README.md` to document the platform abstraction model and current Windows-only status.
+### Fixed
+- Applied platform-boundary stabilization bundle (`Kira-platform-boundary-fix.zip`).
+- Ensured non-Windows CMake checks fail prior to acquiring platform dependencies.
+- Restored `TLS_VERIFY ON` certificate validation for WebView2 SDK download.
+- Separated post-readiness security failure handling to `FatalErrorCallback`.
+- Guaranteed one-shot readiness completion and distinct non-zero terminal exit codes for platform runtime failures.
+- Enforced Win32 `GetMessage == -1` failure handling as `event_loop_failed`.
+- Expanded `test_app_host.cpp` to exercise thread-safe state synchronization and in-flight worker task shutdown sequence.
 
 ## [0.2.0] - 2026-07-26
 

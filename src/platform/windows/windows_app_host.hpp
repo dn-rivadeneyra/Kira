@@ -33,6 +33,9 @@ public:
     int run_event_loop() override;
 
 private:
+    void complete_readiness(PlatformResult result);
+    void report_fatal(PlatformResult result);
+
     WindowConfig config_;
     RawMessageCallback on_message_;
     ReadyCallback on_ready_;
@@ -43,6 +46,8 @@ private:
     std::atomic<bool> is_started_{false};
     std::atomic<bool> is_ready_{false};
     std::atomic<bool> is_closed_{false};
+    std::atomic<bool> readiness_reported_{false};
+    std::atomic<bool> fatal_reported_{false};
 };
 
 } // namespace kira::platform
