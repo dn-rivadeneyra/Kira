@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added platform-independent unit test suite `test_app_host.cpp` exercising `AppImpl` coordination with a fake `AppHost`.
 
 ### Fixed
+- Removed dead unreachable `return nullptr;` statement after `static_assert(false, ...)` in `src/platform/platform_factory.cpp`.
+- Replaced absolute `file:///...` links in `AGENTS.md` and `.agents/AGENTS.md` with relative repository markdown file paths.
+- Added SHA256 `URL_HASH` validation pin (`5a3bd2be7685af09c5dc4a999b77ffc1fdc20e4a4c8bb253907f6beec42a0d47`) for Microsoft WebView2 NuGet download in `cmake/Dependencies.cmake`.
 - Enforced strict `event_loop_thread_id_ != 0` check in `WindowsAppHost::post_quit`, returning `false` and logging error when event loop thread ID is uninitialized.
 - Applied `post_quit` hardening patch (`kira_post_quit_fix.zip`).
 - `WindowsAppHost::post_quit` now returns `bool` and checks `PostThreadMessage(WM_QUIT)` result, logging diagnostic errors with `GetLastError()` upon failure.

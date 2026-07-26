@@ -11,7 +11,6 @@ std::unique_ptr<AppHost> create_app_host(const WindowConfig& config) {
     return std::make_unique<WindowsAppHost>(config);
 #else
     static_assert(false, "Kira currently supports Windows only");
-    return nullptr;
 #endif
 }
 

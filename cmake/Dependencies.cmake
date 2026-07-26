@@ -21,6 +21,7 @@ else()
     FetchContent_Declare(
         webview2_sdk
         URL https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40
+        URL_HASH SHA256=5a3bd2be7685af09c5dc4a999b77ffc1fdc20e4a4c8bb253907f6beec42a0d47
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         TLS_VERIFY ON
     )
