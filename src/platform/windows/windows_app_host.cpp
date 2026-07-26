@@ -43,6 +43,14 @@ bool WindowsAppHost::post_host_message(UINT message) {
     return false;
 }
 
+void WindowsAppHost::post_quit(int exit_code) {
+    if (event_loop_thread_id_ != 0 && GetCurrentThreadId() != event_loop_thread_id_) {
+        PostThreadMessage(event_loop_thread_id_, WM_QUIT, static_cast<WPARAM>(exit_code), 0);
+    } else {
+        PostQuitMessage(exit_code);
+    }
+}
+
 void WindowsAppHost::defer_readiness(PlatformResult result) {
     if (readiness_reported_.exchange(true)) {
         return;
@@ -57,7 +65,7 @@ void WindowsAppHost::defer_readiness(PlatformResult result) {
         // Do not invoke application callbacks from the native callback stack.
         // A quit message lets run_event_loop return; AppImpl then performs its
         // normal platform-independent shutdown path with a non-zero result.
-        PostQuitMessage(1);
+        post_quit(1);
     }
 }
 
@@ -74,7 +82,7 @@ void WindowsAppHost::defer_fatal(PlatformResult result) {
     }
 
     if (!post_host_message(WM_KIRA_HOST_FATAL)) {
-        PostQuitMessage(1);
+        post_quit(1);
     }
 }
 
@@ -153,7 +161,7 @@ void WindowsAppHost::start(
         },
         [this]() {
             if (!post_host_message(WM_KIRA_APP_SHUTDOWN)) {
-                PostQuitMessage(0);
+                post_quit(0);
             }
         },
         [this](HRESULT hr, std::string diagnostic) {
@@ -198,7 +206,7 @@ void WindowsAppHost::request_close() {
         window_->close();
         window_.reset();
     }
-    PostQuitMessage(0);
+    post_quit(0);
 }
 
 int WindowsAppHost::run_event_loop() {

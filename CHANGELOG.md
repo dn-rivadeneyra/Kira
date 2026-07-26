@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added platform-independent unit test suite `test_app_host.cpp` exercising `AppImpl` coordination with a fake `AppHost`.
 
 ### Fixed
+- Added defensive `WindowsAppHost::post_quit` helper targeting `event_loop_thread_id_` via `PostThreadMessage(..., WM_QUIT, ...)` when called from non-UI threads.
 - Applied terminal callback deferral fix (`kira_terminal_callback_fix.zip`).
 - Defer readiness and fatal error callback delivery via custom Windows messages (`WM_KIRA_HOST_READY` and `WM_KIRA_HOST_FATAL`) in `WindowsAppHost::run_event_loop`.
 - Prevented native COM/WebView2 and WndProc re-entrancy during terminal callback dispatch.
