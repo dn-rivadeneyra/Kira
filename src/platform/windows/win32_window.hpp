@@ -113,7 +113,7 @@ private:
 
     Microsoft::WRL::ComPtr<ICoreWebView2Controller> webview_controller_;
     Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
-    std::unique_ptr<WebViewTransport> transport_;
+    std::shared_ptr<WebViewTransport> transport_;
 
     std::shared_ptr<WindowAsyncState> win_state_;
     DWORD ui_thread_id_{0};

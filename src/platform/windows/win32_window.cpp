@@ -212,13 +212,25 @@ bool NativeWindow::initialize() {
     }
 
     win_state_->hwnd = hwnd_;
-    transport_ = std::make_unique<WebViewTransport>(config_, on_message_);
+    std::weak_ptr<WindowAsyncState> weak_win_state = win_state_;
+    transport_ = std::make_shared<WebViewTransport>(
+        config_,
+        on_message_,
+        [weak_win_state](HRESULT security_hr) {
+            auto state = weak_win_state.lock();
+            if (!state || !state->alive.load()) {
+                return;
+            }
+            std::cerr << "[Kira Security Critical] Transport security failure, hr=0x" << std::hex << security_hr << std::endl;
+            state->complete_initialization(false);
+        }
+    );
 
-    // Initialize WebView2 Environment asynchronously (NO 'this' captured in COM callback lambda!)
+    // Initialize WebView2 Environment asynchronously
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, nullptr, nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [weak_win = std::weak_ptr<WindowAsyncState>(win_state_), transport_ptr = transport_.get()](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+            [weak_win = std::weak_ptr<WindowAsyncState>(win_state_), weak_transport = std::weak_ptr<WebViewTransport>(transport_)](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 auto win = weak_win.lock();
                 if (!win || !win->alive.load()) return S_OK;
 
@@ -228,11 +240,11 @@ bool NativeWindow::initialize() {
                     return result;
                 }
 
-                // Create Controller (NO 'this' captured in COM callback lambda!)
+                // Create Controller
                 HRESULT hr_ctrl = env->CreateCoreWebView2Controller(
                     win->hwnd,
                     Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [weak_win, transport_ptr](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                        [weak_win, weak_transport](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
                             auto win2 = weak_win.lock();
                             if (!win2 || !win2->alive.load()) return S_OK;
 
@@ -289,7 +301,13 @@ bool NativeWindow::initialize() {
                             }
 
                             // Asynchronous attach: transport attachment continues only after bootstrap registration completes
-                            transport_ptr->attach(win2->webview.Get(), [weak_win](HRESULT attach_hr) {
+                            auto transport = weak_transport.lock();
+                            if (!transport) {
+                                win2->complete_initialization(false);
+                                return E_ABORT;
+                            }
+
+                            transport->attach(win2->webview.Get(), [weak_win](HRESULT attach_hr) {
                                 auto win3 = weak_win.lock();
                                 if (!win3 || !win3->alive.load()) return;
 
@@ -299,7 +317,7 @@ bool NativeWindow::initialize() {
                                     return;
                                 }
 
-                                // Register initial NavigationCompleted handler (NO 'this' captured in COM callback lambda!)
+                                // Register initial NavigationCompleted handler
                                 HRESULT hr_nav = win3->webview->add_NavigationCompleted(
                                     Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
                                         [weak_win](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
@@ -372,38 +390,32 @@ bool NativeWindow::initialize() {
         return false;
     }
 
-    // Keep active webview and controller synchronized on NativeWindow instance
-    if (win_state_) {
-        webview_controller_ = win_state_->webview_controller;
-        webview_ = win_state_->webview;
-    }
-
     return true;
 }
 
 HRESULT NativeWindow::navigate() {
     if (!check_ui_thread()) return E_FAIL;
-    if (!webview_) return E_POINTER;
+    if (!win_state_ || !win_state_->webview) return E_POINTER;
 
     HRESULT hr = S_OK;
     if (!config_.dev_url.empty()) {
         std::wstring wurl = string_to_wstring(config_.dev_url);
-        hr = webview_->Navigate(wurl.c_str());
+        hr = win_state_->webview->Navigate(wurl.c_str());
     } else {
-        hr = webview_->Navigate(L"https://kira.local/index.html");
+        hr = win_state_->webview->Navigate(L"https://kira.local/index.html");
     }
     return hr;
 }
 
 void NativeWindow::resize_webview() {
     if (!check_ui_thread()) return;
-    if (webview_controller_ && hwnd_) {
+    if (win_state_ && win_state_->webview_controller && hwnd_) {
         RECT bounds;
         if (!GetClientRect(hwnd_, &bounds)) {
             std::cerr << "[Kira Window Error] GetClientRect failed, err=" << GetLastError() << std::endl;
             return;
         }
-        HRESULT hr = webview_controller_->put_Bounds(bounds);
+        HRESULT hr = win_state_->webview_controller->put_Bounds(bounds);
         if (FAILED(hr)) {
             std::cerr << "[Kira Window Error] put_Bounds failed, hr=0x" << std::hex << hr << std::endl;
         }
