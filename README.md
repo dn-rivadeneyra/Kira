@@ -8,22 +8,23 @@
 
 Kira enforces clean separation of concerns, process event loop ownership, and thread safety across its components:
 
-- **`App`**: Process event loop owner, readiness state machine manager, and application lifecycle controller.
+- **`App`**: Process event loop owner, readiness state machine manager, deferred application shutdown coordinator (`WM_KIRA_APP_SHUTDOWN`), and process lifecycle controller.
 - **`CommandRegistry`**: Command handler store validating names against `[A-Za-z][A-Za-z0-9_.-]{0,127}` manually without regex.
 - **`ProtocolCodec`**: Version 1 protocol parser and serializer emitting discriminated results (`type: "invoke"`, `type: "result"`, `type: "protocol_error"`).
 - **`CommandExecutor`**: Command dispatcher masking native exceptions to `command_exception` error codes.
 - **`WorkerExecutor`**: Single serial FIFO worker thread executing commands off the UI thread with clean joining shutdown.
 - **`InvocationPipeline`**: Private platform-independent pipeline orchestrating parsing, execution, and response delivery.
 - **`SecurityPolicy`**: Origin normalization using Windows `CreateUri` / `IUri` API.
-- **`WebViewTransport`**: Raw UTF-8 IPC message transport and WebView2 event handler.
-- **`NativeWindow`**: Win32 window manager dispatching responses back to the UI thread via instance message queues (`WM_USER + 100`) and notifying `App` on window close (`WM_CLOSE`).
+- **`WebViewTransport`**: Transactional raw UTF-8 IPC transport, native bootstrap script installer, and top-level `WebMessageReceived` event handler.
+- **`NativeWindow`**: Win32 window manager dispatching UI-thread responses (`WM_USER + 100`), managing one-shot document readiness completion, and deferring window close requests (`WM_CLOSE`) to `AppImpl`.
 
 ---
 
-## Security Model
+## Security & Frame Policy Model
 
-- **Top-Level Document Enforcement**: Native IPC is strictly restricted to top-level documents using WebView2 `ICoreWebView2WebMessageReceivedEventArgs2::get_SourceFrame`. Web messages from child frames (`<iframe>`) are rejected.
-- **Development Mode**: Navigation and IPC messages are validated against the exact configured `dev_url` origin using `CreateUri` / `IUri` (scheme, host, and port matching). Unapproved top-level navigations are canceled during `NavigationStarting`.
+- **Top-Level Document Event Subscription**: Kira subscribes to `ICoreWebView2::WebMessageReceived` on the top-level `CoreWebView2`. Frame `WebMessageReceived` events are not subscribed.
+- **Source Origin Authorization**: The sender URL of every received top-level message is validated against the active top-level document URL (`webview_->get_Source`) and the approved origin policy. Messages from unapproved origins or mismatched contexts are rejected before protocol processing.
+- **Development Mode**: Navigations and IPC messages are validated against the exact configured `dev_url` origin using `CreateUri` / `IUri` (scheme, host, and port matching). Unapproved top-level navigations are canceled during `NavigationStarting`.
 - **Production Mode**: Production assets are served under the virtual host domain `https://kira.local/` using `SetVirtualHostNameToFolderMapping` (`ICoreWebView2_3`). Direct `file:///` navigation is blocked.
 - **Native Bridge Isolation**: The low-level transport bridge is isolated under `window.__KIRA_INTERNAL__`. The public frontend API is exposed via the browser ES module `packages/api/kira.js`.
 
@@ -34,8 +35,8 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
 - **Supported Platform**: Windows only (Win32 API + Microsoft WebView2 Runtime).
 - **Toolchain**: C++23 compiler (MSVC 2022/2026 v143+) and CMake 3.25+.
 - **Automated Dependencies**:
-  - `nlohmann/json` `v3.11.3` (acquired via CMake `FetchContent` into build tree with SHA-256 validation).
-  - `Microsoft.Web.WebView2` `1.0.2903.40` SDK (acquired via CMake `FetchContent` into build tree).
+  - `nlohmann/json` `v3.11.3` (acquired via CMake `FetchContent` with TLS verification and SHA-256 URL_HASH validation).
+  - `Microsoft.Web.WebView2` `1.0.2903.40` SDK (acquired via CMake `FetchContent` with TLS verification and build artifact validation for `WebView2.h`, `WebView2Loader.dll.lib`, and `WebView2Loader.dll`).
 
 ---
 
@@ -51,16 +52,19 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
    cmake --build build --config Debug
    ```
 
-3. **Run Automated Unit & Pipeline Tests**:
+3. **Run Automated Unit & Integration Tests**:
    ```cmd
    ctest --test-dir build --output-on-failure
    ```
-   *(Runs platform-independent `test_protocol`, `test_registry`, `test_executor`, `pipeline_tests`, and `test_security` without requiring a visible WebView2 session).*
+   *(Runs platform-independent `test_protocol`, `test_registry`, `test_executor`, `test_security`, `pipeline_tests`, and `test_lifecycle` without requiring a visible WebView2 session).*
 
 4. **Run Windows Example Application**:
    ```cmd
    .\build\Debug\kira_example.exe
    ```
+
+5. **Manual Iframe Security Smoke Test**:
+   Open `assets/iframe_test.html` in the WebView application to verify that top-level invocations reach native commands while iframe postMessage invocations are ignored.
 
 ---
 

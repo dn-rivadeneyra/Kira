@@ -8,13 +8,21 @@
 #include <functional>
 #include <vector>
 #include <mutex>
+#include <atomic>
 #include "kira/app.hpp"
 #include "src/platform/windows/webview_transport.hpp"
 
 namespace kira {
 
-constexpr UINT WM_KIRA_IPC_RESPONSE  = WM_USER + 100;
-constexpr UINT WM_KIRA_INIT_COMPLETE = WM_USER + 101;
+constexpr UINT WM_KIRA_IPC_RESPONSE   = WM_USER + 100;
+constexpr UINT WM_KIRA_INIT_COMPLETE  = WM_USER + 101;
+constexpr UINT WM_KIRA_APP_SHUTDOWN   = WM_USER + 102;
+
+enum class InitializationResult {
+    pending,
+    succeeded,
+    failed
+};
 
 class NativeWindow {
 public:
@@ -39,6 +47,8 @@ public:
     void hide();
     void close();
 
+    HRESULT navigate();
+
     // Instance response queue posting (no global state)
     void post_ui_response(const std::string& response_json);
 
@@ -48,8 +58,8 @@ public:
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     void resize_webview();
-    void navigate();
     void drain_response_queue();
+    void complete_initialization(bool success);
 
     WindowConfig config_;
     RawMessageCallback on_message_;
@@ -62,7 +72,10 @@ private:
     std::unique_ptr<WebViewTransport> transport_;
 
     EventRegistrationToken nav_completed_token_{};
-    std::shared_ptr<bool> alive_token_;
+    std::shared_ptr<CallbackLifetime> lifetime_;
+
+    std::atomic<InitializationResult> init_result_{InitializationResult::pending};
+    std::atomic<bool> closed_{false};
 
     // Instance-owned response queue and mutex
     std::mutex response_mutex_;

@@ -21,7 +21,7 @@ static std::string wstring_to_string(const std::wstring& wstr) {
 }
 
 WebViewTransport::WebViewTransport(const WindowConfig& config, MessageCallback on_message)
-    : config_(config), on_message_(std::move(on_message)), alive_token_(std::make_shared<bool>(true)) {}
+    : config_(config), on_message_(std::move(on_message)), lifetime_(std::make_shared<CallbackLifetime>()) {}
 
 WebViewTransport::~WebViewTransport() {
     detach();
@@ -29,16 +29,23 @@ WebViewTransport::~WebViewTransport() {
 
 void WebViewTransport::detach() {
     ready_ = false;
-    if (alive_token_) {
-        *alive_token_ = false; // Invalidate all pending async callbacks
+    if (lifetime_) {
+        lifetime_->alive.store(false);
+        lifetime_.reset();
     }
     if (webview_) {
         if (web_message_token_.value != 0) {
-            webview_->remove_WebMessageReceived(web_message_token_);
+            HRESULT hr = webview_->remove_WebMessageReceived(web_message_token_);
+            if (FAILED(hr)) {
+                std::cerr << "[Kira Transport] Failed to remove WebMessageReceived handler, hr=0x" << std::hex << hr << std::endl;
+            }
             web_message_token_.value = 0;
         }
         if (nav_starting_token_.value != 0) {
-            webview_->remove_NavigationStarting(nav_starting_token_);
+            HRESULT hr = webview_->remove_NavigationStarting(nav_starting_token_);
+            if (FAILED(hr)) {
+                std::cerr << "[Kira Transport] Failed to remove NavigationStarting handler, hr=0x" << std::hex << hr << std::endl;
+            }
             nav_starting_token_.value = 0;
         }
         webview_ = nullptr;
@@ -48,19 +55,107 @@ void WebViewTransport::detach() {
 bool WebViewTransport::attach(ICoreWebView2* webview) {
     if (!webview) return false;
     webview_ = webview;
+    if (!lifetime_) {
+        lifetime_ = std::make_shared<CallbackLifetime>();
+    }
 
-    setup_navigation_security();
-    inject_native_bootstrap();
+    // Transactional Attach Sequence:
+    // 1. Install native bootstrap script
+    HRESULT hr_boot = install_native_bootstrap();
+    if (FAILED(hr_boot)) {
+        std::cerr << "[Kira Transport] Native bootstrap installation failed, hr=0x" << std::hex << hr_boot << std::endl;
+        detach();
+        return false;
+    }
 
-    // Top-Level Document & Origin Security Policy:
-    // 1. webview_->get_Source(&top_source) retrieves the top-level document's URL.
-    // 2. args->get_Source(&source) retrieves the sending document's URL.
-    // 3. Web messages are authorized ONLY if the sender URL matches an approved origin
-    //    and matches the active top-level document origin. Child frames with unapproved origins or mismatched contexts are rejected.
+    // 2. Register navigation security handler
+    HRESULT hr_nav = setup_navigation_security();
+    if (FAILED(hr_nav)) {
+        std::cerr << "[Kira Transport] Navigation security handler registration failed, hr=0x" << std::hex << hr_nav << std::endl;
+        detach();
+        return false;
+    }
+
+    // 3. Register top-level web message handler
+    HRESULT hr_msg = setup_web_message_handler();
+    if (FAILED(hr_msg)) {
+        std::cerr << "[Kira Transport] Web message handler registration failed, hr=0x" << std::hex << hr_msg << std::endl;
+        detach();
+        return false;
+    }
+
+    ready_ = true;
+    return true;
+}
+
+HRESULT WebViewTransport::install_native_bootstrap() {
+    if (!webview_) return E_POINTER;
+
+    // Native bootstrap under window.__KIRA_INTERNAL__
+    std::wstring bootstrap_js = L"(function() {\n"
+                                L"    if (window.__KIRA_INTERNAL__) return;\n"
+                                L"    const callbacks = new Set();\n"
+                                L"    window.__KIRA_INTERNAL__ = Object.freeze({\n"
+                                L"        send: function(msg) {\n"
+                                L"            if (typeof msg === 'string') {\n"
+                                L"                window.chrome.webview.postMessage(msg);\n"
+                                L"            }\n"
+                                L"        },\n"
+                                L"        onMessage: function(cb) {\n"
+                                L"            if (typeof cb === 'function') callbacks.add(cb);\n"
+                                L"        }\n"
+                                L"    });\n"
+                                L"    window.chrome.webview.addEventListener('message', function(event) {\n"
+                                L"        const data = event.data;\n"
+                                L"        callbacks.forEach(cb => {\n"
+                                L"            try { cb(data); } catch (e) { console.error('[Kira Bootstrap]', e); }\n"
+                                L"        });\n"
+                                L"    });\n"
+                                L"})();";
+
+    HRESULT hr = webview_->AddScriptToExecuteOnDocumentCreated(bootstrap_js.c_str(), nullptr);
+    return hr;
+}
+
+HRESULT WebViewTransport::setup_navigation_security() {
+    if (!webview_) return E_POINTER;
+
+    // Register NavigationStarting handler to cancel unapproved top-level origin navigation
+    HRESULT hr = webview_->add_NavigationStarting(
+        Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
+            [this, weak_life = std::weak_ptr<CallbackLifetime>(lifetime_)](ICoreWebView2* /*sender*/, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                auto life = weak_life.lock();
+                if (!life || !life->alive.load() || !args) return S_OK;
+
+                PWSTR uri_raw = nullptr;
+                if (SUCCEEDED(args->get_Uri(&uri_raw)) && uri_raw) {
+                    std::string target_uri = wstring_to_string(uri_raw);
+                    CoTaskMemFree(uri_raw);
+
+                    if (!SecurityPolicy::is_approved_origin(target_uri, config_)) {
+                        std::cerr << "[Kira Security] Blocked navigation to unapproved origin: " << target_uri << std::endl;
+                        args->put_Cancel(TRUE);
+                    }
+                }
+                return S_OK;
+            }).Get(),
+        &nav_starting_token_
+    );
+    return hr;
+}
+
+HRESULT WebViewTransport::setup_web_message_handler() {
+    if (!webview_) return E_POINTER;
+
+    // Top-level WebMessageReceived event subscription:
+    // 1. Kira subscribes to top-level WebMessageReceived on CoreWebView2.
+    // 2. Frame WebMessageReceived events are not subscribed.
+    // 3. Sender URL is validated against the approved origin policy and top-level document URL.
     HRESULT hr = webview_->add_WebMessageReceived(
         Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-            [this, token = alive_token_](ICoreWebView2* /*sender*/, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                if (!*token || !ready_ || !args) return S_OK;
+            [this, weak_life = std::weak_ptr<CallbackLifetime>(lifetime_)](ICoreWebView2* /*sender*/, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                auto life = weak_life.lock();
+                if (!life || !life->alive.load() || !ready_ || !args) return S_OK;
 
                 // Retrieve top-level document URL from WebView
                 PWSTR top_raw = nullptr;
@@ -90,7 +185,7 @@ bool WebViewTransport::attach(ICoreWebView2* webview) {
                     auto top_opt = SecurityPolicy::parse_and_normalize_origin(top_uri);
                     auto src_opt = SecurityPolicy::parse_and_normalize_origin(source_uri);
                     if (!top_opt || !src_opt || !SecurityPolicy::matches_origin(*top_opt, *src_opt)) {
-                        std::cerr << "[Kira Security] Rejected message from mismatched frame origin: " << source_uri << std::endl;
+                        std::cerr << "[Kira Security] Rejected message from mismatched origin: " << source_uri << std::endl;
                         return S_OK;
                     }
                 } else {
@@ -111,74 +206,20 @@ bool WebViewTransport::attach(ICoreWebView2* webview) {
             }).Get(),
         &web_message_token_
     );
-
-    if (FAILED(hr)) {
-        return false;
-    }
-
-    ready_ = true;
-    return true;
-}
-
-void WebViewTransport::setup_navigation_security() {
-    if (!webview_) return;
-
-    // Register NavigationStarting handler to cancel unapproved top-level origin navigation
-    webview_->add_NavigationStarting(
-        Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-            [this, token = alive_token_](ICoreWebView2* /*sender*/, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
-                if (!*token || !args) return S_OK;
-                PWSTR uri_raw = nullptr;
-                if (SUCCEEDED(args->get_Uri(&uri_raw)) && uri_raw) {
-                    std::string target_uri = wstring_to_string(uri_raw);
-                    CoTaskMemFree(uri_raw);
-
-                    if (!SecurityPolicy::is_approved_origin(target_uri, config_)) {
-                        std::cerr << "[Kira Security] Blocked navigation to unapproved origin: " << target_uri << std::endl;
-                        args->put_Cancel(TRUE);
-                    }
-                }
-                return S_OK;
-            }).Get(),
-        &nav_starting_token_
-    );
-}
-
-void WebViewTransport::inject_native_bootstrap() {
-    if (!webview_) return;
-
-    // Native bootstrap under window.__KIRA_INTERNAL__
-    std::wstring bootstrap_js = L"(function() {\n"
-                                L"    if (window.__KIRA_INTERNAL__) return;\n"
-                                L"    const callbacks = new Set();\n"
-                                L"    window.__KIRA_INTERNAL__ = Object.freeze({\n"
-                                L"        send: function(msg) {\n"
-                                L"            if (typeof msg === 'string') {\n"
-                                L"                window.chrome.webview.postMessage(msg);\n"
-                                L"            }\n"
-                                L"        },\n"
-                                L"        onMessage: function(cb) {\n"
-                                L"            if (typeof cb === 'function') callbacks.add(cb);\n"
-                                L"        }\n"
-                                L"    });\n"
-                                L"    window.chrome.webview.addEventListener('message', function(event) {\n"
-                                L"        const data = event.data;\n"
-                                L"        callbacks.forEach(cb => {\n"
-                                L"            try { cb(data); } catch (e) { console.error('[Kira Bootstrap]', e); }\n"
-                                L"        });\n"
-                                L"    });\n"
-                                L"})();";
-
-    webview_->AddScriptToExecuteOnDocumentCreated(bootstrap_js.c_str(), nullptr);
+    return hr;
 }
 
 bool WebViewTransport::send_message(const std::string& raw_utf8_message) {
-    if (!ready_ || !*alive_token_ || !webview_) {
+    if (!ready_ || !lifetime_ || !lifetime_->alive.load() || !webview_) {
         return false;
     }
     std::wstring wmsg = string_to_wstring(raw_utf8_message);
     HRESULT hr = webview_->PostWebMessageAsString(wmsg.c_str());
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) {
+        std::cerr << "[Kira Transport] PostWebMessageAsString failed, hr=0x" << std::hex << hr << std::endl;
+        return false;
+    }
+    return true;
 }
 
 } // namespace kira

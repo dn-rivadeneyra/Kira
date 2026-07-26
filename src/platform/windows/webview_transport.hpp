@@ -6,9 +6,14 @@
 #include <string>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include "kira/app.hpp"
 
 namespace kira {
+
+struct CallbackLifetime {
+    std::atomic_bool alive{true};
+};
 
 class WebViewTransport {
 public:
@@ -26,11 +31,12 @@ public:
     // Posts raw UTF-8 string message back to JS context (must run on Win32 UI thread)
     bool send_message(const std::string& raw_utf8_message);
 
-    bool is_ready() const { return webview_ != nullptr && ready_ && *alive_token_; }
+    bool is_ready() const { return webview_ != nullptr && ready_ && lifetime_ && lifetime_->alive.load(); }
 
 private:
-    void inject_native_bootstrap();
-    void setup_navigation_security();
+    HRESULT install_native_bootstrap();
+    HRESULT setup_navigation_security();
+    HRESULT setup_web_message_handler();
 
     WindowConfig config_;
     MessageCallback on_message_;
@@ -38,8 +44,7 @@ private:
     EventRegistrationToken web_message_token_{};
     EventRegistrationToken nav_starting_token_{};
 
-    // Shared lifetime token for safe asynchronous callbacks
-    std::shared_ptr<bool> alive_token_;
+    std::shared_ptr<CallbackLifetime> lifetime_;
     bool ready_{false};
 };
 

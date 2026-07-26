@@ -50,21 +50,29 @@ public:
                 init_finished = true;
             },
             [this]() {
-                // Window close requested callback (e.g. WM_CLOSE)
-                shutdown();
-                PostQuitMessage(0);
+                // Window close requested callback (WM_CLOSE).
+                // Posts deferred application shutdown message to Win32 message queue so WndProc returns safely first.
+                if (window_ && window_->get_hwnd()) {
+                    PostMessage(window_->get_hwnd(), WM_KIRA_APP_SHUTDOWN, 0, 0);
+                }
             }
         );
 
         if (!window_->initialize()) {
             state_ = ReadinessState::failed;
             std::cerr << "[Kira Error] Native window initialization failed." << std::endl;
+            shutdown();
             return -1;
         }
 
         // Win32 Message Loop - processes messages until initialization completes and app exits
         MSG msg;
         while (GetMessage(&msg, NULL, 0, 0)) {
+            if (msg.message == WM_KIRA_APP_SHUTDOWN) {
+                shutdown();
+                break;
+            }
+
             TranslateMessage(&msg);
             DispatchMessage(&msg);
 
@@ -95,31 +103,34 @@ public:
     }
 
     void shutdown() {
-        if (state_ == ReadinessState::closed) {
-            return;
+        if (shutdown_requested_.exchange(true)) {
+            return; // Idempotent guard: first shutdown request wins, subsequent calls ignored
         }
 
-        // 1. Stop accepting new IPC requests
-        // 2. Mark app as closing
+        // 1. Mark app as closing and stop accepting new IPC requests
         state_ = ReadinessState::closing;
         pipeline_.shutdown();
 
-        // 3. Stop worker, 4. Finish current task, 5. Discard unstarted, 6. Join thread
+        // 2. Stop worker: finish current task, discard queued, join thread
         worker_.stop_and_join();
 
-        // 7. Discard completed responses if WebView is no longer ready / 8. Destroy transport / 9. Destroy window
+        // 3. Destroy window and transport safely outside WndProc callback
         if (window_) {
             window_->close();
             window_.reset();
         }
 
-        // 10. Mark app as closed
+        // 4. Post quit message after safe resource cleanup
+        PostQuitMessage(0);
+
+        // 5. Mark app as closed
         state_ = ReadinessState::closed;
     }
 
 private:
     AppConfig config_;
     std::atomic<ReadinessState> state_{ReadinessState::created};
+    std::atomic<bool> shutdown_requested_{false};
     CommandRegistry registry_;
     WorkerExecutor worker_;
     InvocationPipeline pipeline_;

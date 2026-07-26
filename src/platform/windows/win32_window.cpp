@@ -30,15 +30,20 @@ NativeWindow::NativeWindow(
       on_message_(std::move(on_message)),
       on_init_(std::move(on_init)),
       on_close_requested_(std::move(on_close_requested)),
-      alive_token_(std::make_shared<bool>(true)) {}
+      lifetime_(std::make_shared<CallbackLifetime>()) {}
 
 NativeWindow::~NativeWindow() {
     close();
 }
 
 void NativeWindow::close() {
-    if (alive_token_) {
-        *alive_token_ = false; // Invalidate all pending callbacks
+    if (closed_.exchange(true)) {
+        return; // Idempotent return if already closed
+    }
+
+    if (lifetime_) {
+        lifetime_->alive.store(false);
+        lifetime_.reset();
     }
 
     if (transport_) {
@@ -52,7 +57,10 @@ void NativeWindow::close() {
     }
 
     if (webview_controller_) {
-        webview_controller_->Close();
+        HRESULT hr = webview_controller_->Close();
+        if (FAILED(hr)) {
+            std::cerr << "[Kira Window] webview_controller_->Close failed, hr=0x" << std::hex << hr << std::endl;
+        }
         webview_controller_ = nullptr;
     }
 
@@ -68,6 +76,25 @@ void NativeWindow::close() {
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         response_queue_.clear();
+    }
+}
+
+void NativeWindow::complete_initialization(bool success) {
+    InitializationResult expected = InitializationResult::pending;
+    InitializationResult desired = success ? InitializationResult::succeeded : InitializationResult::failed;
+
+    if (!init_result_.compare_exchange_strong(expected, desired)) {
+        return; // One-shot guard: first call wins, subsequent calls ignored
+    }
+
+    // Remove initialization-only NavigationCompleted handler
+    if (webview_ && nav_completed_token_.value != 0) {
+        webview_->remove_NavigationCompleted(nav_completed_token_);
+        nav_completed_token_.value = 0;
+    }
+
+    if (hwnd_) {
+        PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, success ? 1 : 0, 0);
     }
 }
 
@@ -119,7 +146,7 @@ void NativeWindow::drain_response_queue() {
         std::swap(pending, response_queue_);
     }
 
-    if (transport_ && transport_->is_ready() && alive_token_ && *alive_token_) {
+    if (transport_ && transport_->is_ready() && lifetime_ && lifetime_->alive.load()) {
         for (const auto& resp : pending) {
             transport_->send_message(resp);
         }
@@ -165,7 +192,8 @@ bool NativeWindow::initialize() {
     );
 
     if (!hwnd_) {
-        std::cerr << "[Kira] Failed to create Win32 window handle." << std::endl;
+        std::cerr << "[Kira Error] Failed to create Win32 window handle." << std::endl;
+        complete_initialization(false);
         return false;
     }
 
@@ -175,29 +203,36 @@ bool NativeWindow::initialize() {
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, nullptr, nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this, token = alive_token_](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                if (!*token) return S_OK;
+            [this, weak_life = std::weak_ptr<CallbackLifetime>(lifetime_)](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                auto life = weak_life.lock();
+                if (!life || !life->alive.load()) return S_OK;
 
                 if (FAILED(result) || !env) {
-                    std::cerr << "[Kira] CreateCoreWebView2EnvironmentWithOptions failed." << std::endl;
-                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                    std::cerr << "[Kira Error] CreateCoreWebView2EnvironmentWithOptions failed, hr=0x" << std::hex << result << std::endl;
+                    complete_initialization(false);
                     return result;
                 }
 
-                env->CreateCoreWebView2Controller(
+                HRESULT hr_ctrl = env->CreateCoreWebView2Controller(
                     hwnd_,
                     Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this, token](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
-                            if (!*token) return S_OK;
+                        [this, weak_life](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                            auto life2 = weak_life.lock();
+                            if (!life2 || !life2->alive.load()) return S_OK;
 
                             if (FAILED(res) || !controller) {
-                                std::cerr << "[Kira] CreateCoreWebView2Controller failed." << std::endl;
-                                if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                std::cerr << "[Kira Error] CreateCoreWebView2Controller failed, hr=0x" << std::hex << res << std::endl;
+                                complete_initialization(false);
                                 return res;
                             }
 
                             webview_controller_ = controller;
-                            webview_controller_->get_CoreWebView2(&webview_);
+                            HRESULT hr_get = webview_controller_->get_CoreWebView2(&webview_);
+                            if (FAILED(hr_get) || !webview_) {
+                                std::cerr << "[Kira Error] get_CoreWebView2 failed, hr=0x" << std::hex << hr_get << std::endl;
+                                complete_initialization(false);
+                                return hr_get;
+                            }
 
                             resize_webview();
 
@@ -206,15 +241,15 @@ bool NativeWindow::initialize() {
                                 auto asset_opt = SecurityPolicy::validate_asset_directory(config_.asset_dir);
                                 if (!asset_opt.has_value()) {
                                     std::cerr << "[Kira Error] Invalid or missing production asset directory: " << config_.asset_dir << std::endl;
-                                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                    complete_initialization(false);
                                     return E_FAIL;
                                 }
 
                                 Microsoft::WRL::ComPtr<ICoreWebView2_3> webview3;
                                 HRESULT q_hr = webview_.As(&webview3);
                                 if (FAILED(q_hr) || !webview3) {
-                                    std::cerr << "[Kira Error] QueryInterface for ICoreWebView2_3 failed." << std::endl;
-                                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                    std::cerr << "[Kira Error] QueryInterface for ICoreWebView2_3 failed, hr=0x" << std::hex << q_hr << std::endl;
+                                    complete_initialization(false);
                                     return q_hr;
                                 }
 
@@ -226,74 +261,96 @@ bool NativeWindow::initialize() {
 
                                 if (FAILED(map_hr)) {
                                     std::cerr << "[Kira Error] SetVirtualHostNameToFolderMapping failed, hr=0x" << std::hex << map_hr << std::endl;
-                                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                    complete_initialization(false);
                                     return map_hr;
                                 }
                             }
 
                             if (!transport_->attach(webview_.Get())) {
                                 std::cerr << "[Kira Error] Failed to attach transport to WebView2." << std::endl;
-                                if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                complete_initialization(false);
                                 return E_FAIL;
                             }
 
-                            // Attach NavigationCompleted handler to confirm readiness ONLY after top-level document loads successfully
-                            webview_->add_NavigationCompleted(
+                            // Register NavigationCompleted handler for initial document validation
+                            HRESULT hr_nav = webview_->add_NavigationCompleted(
                                 Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [this, token](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
-                                        if (!*token || !args) return S_OK;
+                                    [this, weak_life](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                                        auto life3 = weak_life.lock();
+                                        if (!life3 || !life3->alive.load() || !args) return S_OK;
 
                                         BOOL is_success = FALSE;
                                         if (FAILED(args->get_IsSuccess(&is_success)) || !is_success) {
-                                            std::cerr << "[Kira Error] WebView2 navigation failed or was cancelled." << std::endl;
-                                            if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                            std::cerr << "[Kira Error] WebView2 initial navigation failed or was cancelled." << std::endl;
+                                            complete_initialization(false);
                                             return S_OK;
                                         }
 
                                         PWSTR source_raw = nullptr;
+                                        std::string loaded_uri;
                                         if (SUCCEEDED(webview_->get_Source(&source_raw)) && source_raw) {
-                                            std::string loaded_uri = wstring_to_string(source_raw);
+                                            loaded_uri = wstring_to_string(source_raw);
                                             CoTaskMemFree(source_raw);
-
-                                            if (!SecurityPolicy::is_approved_origin(loaded_uri, config_)) {
-                                                std::cerr << "[Kira Security] Loaded document is not an approved origin: " << loaded_uri << std::endl;
-                                                if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
-                                                return S_OK;
-                                            }
                                         }
 
-                                        // Signal initialization success only after top-level document has loaded
-                                        if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 1, 0);
+                                        if (loaded_uri.empty() || !SecurityPolicy::is_approved_origin(loaded_uri, config_)) {
+                                            std::cerr << "[Kira Security] Loaded document source is invalid or unapproved: " << loaded_uri << std::endl;
+                                            complete_initialization(false);
+                                            return S_OK;
+                                        }
+
+                                        // Signal initialization success only after initial top-level document has loaded & passed validation
+                                        complete_initialization(true);
                                         return S_OK;
                                     }).Get(),
                                 &nav_completed_token_
                             );
 
-                            navigate();
+                            if (FAILED(hr_nav)) {
+                                std::cerr << "[Kira Error] add_NavigationCompleted failed, hr=0x" << std::hex << hr_nav << std::endl;
+                                complete_initialization(false);
+                                return hr_nav;
+                            }
+
+                            HRESULT hr_start_nav = navigate();
+                            if (FAILED(hr_start_nav)) {
+                                std::cerr << "[Kira Error] Navigate failed synchronously, hr=0x" << std::hex << hr_start_nav << std::endl;
+                                complete_initialization(false);
+                                return hr_start_nav;
+                            }
+
                             return S_OK;
                         }).Get()
                 );
+                if (FAILED(hr_ctrl)) {
+                    std::cerr << "[Kira Error] CreateCoreWebView2Controller call failed, hr=0x" << std::hex << hr_ctrl << std::endl;
+                    complete_initialization(false);
+                    return hr_ctrl;
+                }
                 return S_OK;
             }).Get()
     );
 
     if (FAILED(hr)) {
-        std::cerr << "[Kira] CreateCoreWebView2EnvironmentWithOptions request failed." << std::endl;
+        std::cerr << "[Kira Error] CreateCoreWebView2EnvironmentWithOptions request failed, hr=0x" << std::hex << hr << std::endl;
+        complete_initialization(false);
         return false;
     }
 
     return true;
 }
 
-void NativeWindow::navigate() {
-    if (!webview_) return;
+HRESULT NativeWindow::navigate() {
+    if (!webview_) return E_POINTER;
 
+    HRESULT hr = S_OK;
     if (!config_.dev_url.empty()) {
         std::wstring wurl = string_to_wstring(config_.dev_url);
-        webview_->Navigate(wurl.c_str());
+        hr = webview_->Navigate(wurl.c_str());
     } else {
-        webview_->Navigate(L"https://kira.local/index.html");
+        hr = webview_->Navigate(L"https://kira.local/index.html");
     }
+    return hr;
 }
 
 void NativeWindow::resize_webview() {
@@ -318,7 +375,7 @@ void NativeWindow::hide() {
 }
 
 void NativeWindow::post_ui_response(const std::string& response_json) {
-    if (!hwnd_ || !alive_token_ || !*alive_token_) return;
+    if (!hwnd_ || !lifetime_ || !lifetime_->alive.load()) return;
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         response_queue_.push_back(response_json);

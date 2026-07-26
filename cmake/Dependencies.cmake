@@ -1,29 +1,29 @@
 include(FetchContent)
 
-# 1. nlohmann/json (v3.11.3) with pinned SHA-256 URL_HASH
+# 1. nlohmann/json (v3.11.3) with TLS verification and SHA-256 URL_HASH validation
 message(STATUS "Acquiring nlohmann/json v3.11.3...")
 FetchContent_Declare(
     json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
     URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    TLS_VERIFY OFF
+    TLS_VERIFY ON
 )
 FetchContent_MakeAvailable(json)
 
-# 2. Microsoft.Web.WebView2 (1.0.2903.40)
+# 2. Microsoft.Web.WebView2 (1.0.2903.40) with TLS verification
 message(STATUS "Acquiring Microsoft.Web.WebView2 1.0.2903.40 SDK...")
 FetchContent_Declare(
     webview2_sdk
     URL https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    TLS_VERIFY OFF
+    TLS_VERIFY ON
 )
 FetchContent_MakeAvailable(webview2_sdk)
 
 set(WEBVIEW2_INCLUDE_DIR "${webview2_sdk_SOURCE_DIR}/build/native/include")
 
-# Explicit Architecture Mapping
+# Explicit Architecture Selection & Validation
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" SYSTEM_PROC)
 string(TOLOWER "${CMAKE_VS_PLATFORM_NAME}" VS_PLATFORM)
 
@@ -44,10 +44,15 @@ message(STATUS "WebView2 Target Architecture: ${WEBVIEW2_ARCH}")
 set(WEBVIEW2_LIB_DIR "${webview2_sdk_SOURCE_DIR}/build/native/${WEBVIEW2_ARCH}")
 set(WEBVIEW2_DLL_DIR "${webview2_sdk_SOURCE_DIR}/runtimes/win-${WEBVIEW2_ARCH}/native")
 
+# CMake Build Artifact Verification
 if(NOT EXISTS "${WEBVIEW2_INCLUDE_DIR}/WebView2.h")
-    message(FATAL_ERROR "WebView2 SDK headers not found in build tree: ${WEBVIEW2_INCLUDE_DIR}/WebView2.h")
+    message(FATAL_ERROR "Missing required WebView2 header: ${WEBVIEW2_INCLUDE_DIR}/WebView2.h")
 endif()
 
 if(NOT EXISTS "${WEBVIEW2_LIB_DIR}/WebView2Loader.dll.lib")
-    message(FATAL_ERROR "WebView2 import library not found: ${WEBVIEW2_LIB_DIR}/WebView2Loader.dll.lib")
+    message(FATAL_ERROR "Missing required WebView2 import library: ${WEBVIEW2_LIB_DIR}/WebView2Loader.dll.lib")
+endif()
+
+if(NOT EXISTS "${WEBVIEW2_DLL_DIR}/WebView2Loader.dll")
+    message(FATAL_ERROR "Missing required WebView2 loader DLL: ${WEBVIEW2_DLL_DIR}/WebView2Loader.dll")
 endif()

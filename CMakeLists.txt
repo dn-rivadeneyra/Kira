@@ -114,6 +114,19 @@ target_link_libraries(kira_pipeline_tests PRIVATE
 
 add_test(NAME pipeline_tests COMMAND kira_pipeline_tests)
 
+# 6. Lifecycle Unit Test Target
+add_executable(kira_test_lifecycle
+    tests/unit/test_lifecycle.cpp
+    src/core/protocol.cpp
+    src/core/registry.cpp
+    src/core/executor.cpp
+    src/core/worker.cpp
+    src/core/pipeline.cpp
+)
+target_include_directories(kira_test_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kira_test_lifecycle PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME test_lifecycle COMMAND kira_test_lifecycle)
+
 # Example Application
 add_executable(kira_example WIN32
     examples/main.cpp
