@@ -1,8 +1,12 @@
 #pragma once
 
 #include <windows.h>
-#include <memory>
+
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <optional>
+
 #include "kira/app.hpp"
 #include "src/platform/app_host.hpp"
 #include "src/platform/windows/win32_window.hpp"
@@ -33,8 +37,11 @@ public:
     int run_event_loop() override;
 
 private:
-    void complete_readiness(PlatformResult result);
-    void report_fatal(PlatformResult result);
+    void defer_readiness(PlatformResult result);
+    void defer_fatal(PlatformResult result);
+    void deliver_readiness();
+    void deliver_fatal();
+    bool post_host_message(UINT message);
 
     WindowConfig config_;
     RawMessageCallback on_message_;
@@ -48,6 +55,11 @@ private:
     std::atomic<bool> is_closed_{false};
     std::atomic<bool> readiness_reported_{false};
     std::atomic<bool> fatal_reported_{false};
+
+    DWORD event_loop_thread_id_{0};
+    std::mutex terminal_result_mutex_;
+    std::optional<PlatformResult> pending_readiness_;
+    std::optional<PlatformResult> pending_fatal_;
 };
 
 } // namespace kira::platform
