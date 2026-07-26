@@ -1,25 +1,10 @@
 #include "src/platform/windows/security.hpp"
+#include "src/platform/windows/string_utils.hpp"
 #include <algorithm>
 #include <iostream>
 #include <shlwapi.h>
 
 namespace kira {
-
-static std::wstring string_to_wstring(const std::string& str) {
-    if (str.empty()) return L"";
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
-    std::wstring wstr(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstr[0], size_needed);
-    return wstr;
-}
-
-static std::string wstring_to_string(const std::wstring& wstr) {
-    if (wstr.empty()) return "";
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
-    std::string str(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &str[0], size_needed, NULL, NULL);
-    return str;
-}
 
 std::optional<NormalizedOrigin> SecurityPolicy::parse_and_normalize_origin(std::string_view url_str) {
     if (url_str.empty()) return std::nullopt;

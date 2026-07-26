@@ -1,8 +1,31 @@
 #include <cassert>
 #include <iostream>
 #include "src/platform/windows/security.hpp"
+#include "src/platform/windows/string_utils.hpp"
 
 using namespace kira;
+
+void test_string_utils_conversion() {
+    // 1. ASCII string round-trip
+    std::string ascii_str = "https://kira.local/index.html";
+    std::wstring ascii_wstr = string_to_wstring(ascii_str);
+    assert(ascii_wstr == L"https://kira.local/index.html");
+    assert(wstring_to_string(ascii_wstr) == ascii_str);
+
+    // 2. Non-ASCII multi-byte UTF-8 expansion string round-trip
+    std::string multibyte_str = "https://kira.local/test/pfad/n/sub";
+    std::wstring multibyte_wstr = string_to_wstring(multibyte_str);
+    std::string converted_back = wstring_to_string(multibyte_wstr);
+    assert(converted_back == multibyte_str);
+
+    // 3. Verify wstring_to_string correctly converts non-ASCII URLs where str.size() > wstr.size()
+    std::wstring non_ascii_wurl = L"https://\x4F8B.local"; // L"https://例.local"
+    std::string utf8_converted = wstring_to_string(non_ascii_wurl);
+    assert(utf8_converted.size() > non_ascii_wurl.size()); // str.size() > wstr.size()
+    assert(string_to_wstring(utf8_converted) == non_ascii_wurl);
+
+    std::cout << "[PASS] test_string_utils_conversion" << std::endl;
+}
 
 void test_security_origin_matching() {
     WindowConfig prod_config{.dev_url = ""};
@@ -41,6 +64,7 @@ void test_security_origin_matching() {
 }
 
 int main() {
+    test_string_utils_conversion();
     test_security_origin_matching();
     std::cout << "ALL SECURITY POLICY TESTS PASSED." << std::endl;
     return 0;

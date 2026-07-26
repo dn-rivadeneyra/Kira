@@ -21,6 +21,7 @@ add_library(kira STATIC
     src/core/pipeline.cpp
     src/core/shutdown_coordinator.cpp
     src/core/app.cpp
+    src/platform/windows/string_utils.cpp
     src/platform/windows/security.cpp
     src/platform/windows/webview_transport.cpp
     src/platform/windows/win32_window.cpp
@@ -86,6 +87,7 @@ add_test(NAME test_executor COMMAND kira_test_executor)
 # 4. Windows Security Unit Test Target (Windows only, no WebView2 runtime needed)
 add_executable(kira_test_security
     tests/unit/test_security.cpp
+    src/platform/windows/string_utils.cpp
     src/platform/windows/security.cpp
 )
 target_include_directories(kira_test_security PRIVATE

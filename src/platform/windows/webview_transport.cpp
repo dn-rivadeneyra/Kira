@@ -1,5 +1,6 @@
 #include "src/platform/windows/webview_transport.hpp"
 #include "src/platform/windows/security.hpp"
+#include "src/platform/windows/string_utils.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -8,80 +9,6 @@
 namespace kira {
 
 namespace {
-
-std::wstring string_to_wstring(const std::string& value) {
-    if (value.empty()) {
-        return {};
-    }
-
-    const int required = MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,
-        value.data(),
-        static_cast<int>(value.size()),
-        nullptr,
-        0
-    );
-
-    if (required <= 0) {
-        return {};
-    }
-
-    std::wstring result(static_cast<std::size_t>(required), L'\0');
-    const int written = MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,
-        value.data(),
-        static_cast<int>(value.size()),
-        result.data(),
-        required
-    );
-
-    if (written != required) {
-        return {};
-    }
-
-    return result;
-}
-
-std::string wstring_to_string(const std::wstring& value) {
-    if (value.empty()) {
-        return {};
-    }
-
-    const int required = WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        value.data(),
-        static_cast<int>(value.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (required <= 0) {
-        return {};
-    }
-
-    std::string result(static_cast<std::size_t>(required), '\0');
-    const int written = WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        value.data(),
-        static_cast<int>(value.size()),
-        result.data(),
-        required,
-        nullptr,
-        nullptr
-    );
-
-    if (written != required) {
-        return {};
-    }
-
-    return result;
-}
 
 void report_security_failure(
     const std::shared_ptr<AttachOperationState>& state,
