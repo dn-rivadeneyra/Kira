@@ -43,12 +43,28 @@ bool WindowsAppHost::post_host_message(UINT message) {
     return false;
 }
 
-void WindowsAppHost::post_quit(int exit_code) {
-    if (event_loop_thread_id_ != 0 && GetCurrentThreadId() != event_loop_thread_id_) {
-        PostThreadMessage(event_loop_thread_id_, WM_QUIT, static_cast<WPARAM>(exit_code), 0);
-    } else {
+bool WindowsAppHost::post_quit(int exit_code) {
+    if (event_loop_thread_id_ == 0 ||
+        GetCurrentThreadId() == event_loop_thread_id_) {
+        // PostQuitMessage has no failure return value and targets the current
+        // thread, which is the host event-loop thread in this branch.
         PostQuitMessage(exit_code);
+        return true;
     }
+
+    if (PostThreadMessage(
+            event_loop_thread_id_,
+            WM_QUIT,
+            static_cast<WPARAM>(exit_code),
+            0)) {
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+    std::cerr
+        << "[Kira App Error] PostThreadMessage(WM_QUIT) failed, err="
+        << error << std::endl;
+    return false;
 }
 
 void WindowsAppHost::defer_readiness(PlatformResult result) {
@@ -65,7 +81,12 @@ void WindowsAppHost::defer_readiness(PlatformResult result) {
         // Do not invoke application callbacks from the native callback stack.
         // A quit message lets run_event_loop return; AppImpl then performs its
         // normal platform-independent shutdown path with a non-zero result.
-        post_quit(1);
+        if (!post_quit(1)) {
+            std::cerr
+                << "[Kira App Error] Unable to terminate event loop after "
+                   "readiness delivery failure."
+                << std::endl;
+        }
     }
 }
 
@@ -81,8 +102,11 @@ void WindowsAppHost::defer_fatal(PlatformResult result) {
         pending_fatal_.emplace(std::move(result));
     }
 
-    if (!post_host_message(WM_KIRA_HOST_FATAL)) {
-        post_quit(1);
+    if (!post_host_message(WM_KIRA_HOST_FATAL) && !post_quit(1)) {
+        std::cerr
+            << "[Kira App Error] Unable to terminate event loop after "
+               "fatal-event delivery failure."
+            << std::endl;
     }
 }
 
@@ -160,8 +184,12 @@ void WindowsAppHost::start(
                 });
         },
         [this]() {
-            if (!post_host_message(WM_KIRA_APP_SHUTDOWN)) {
-                post_quit(0);
+            if (!post_host_message(WM_KIRA_APP_SHUTDOWN) &&
+                !post_quit(0)) {
+                std::cerr
+                    << "[Kira App Error] Unable to deliver close request or "
+                       "terminate the event loop."
+                    << std::endl;
             }
         },
         [this](HRESULT hr, std::string diagnostic) {
@@ -206,7 +234,13 @@ void WindowsAppHost::request_close() {
         window_->close();
         window_.reset();
     }
-    post_quit(0);
+
+    if (!post_quit(0)) {
+        std::cerr
+            << "[Kira App Error] Native resources closed, but the host event "
+               "loop could not be asked to quit."
+            << std::endl;
+    }
 }
 
 int WindowsAppHost::run_event_loop() {

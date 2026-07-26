@@ -42,7 +42,7 @@ private:
     void deliver_readiness();
     void deliver_fatal();
     bool post_host_message(UINT message);
-    void post_quit(int exit_code);
+    bool post_quit(int exit_code);
 
     WindowConfig config_;
     RawMessageCallback on_message_;
