@@ -11,14 +11,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(json)
 
-# 2. Microsoft.Web.WebView2 (1.0.2903.40) with TLS verification
-message(STATUS "Acquiring Microsoft.Web.WebView2 1.0.2903.40 SDK...")
-FetchContent_Declare(
-    webview2_sdk
-    URL https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    TLS_VERIFY ON
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/webview2.nupkg")
+    FetchContent_Declare(
+        webview2_sdk
+        URL "${CMAKE_CURRENT_SOURCE_DIR}/webview2.nupkg"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+else()
+    FetchContent_Declare(
+        webview2_sdk
+        URL https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        TLS_VERIFY OFF
+    )
+endif()
 FetchContent_MakeAvailable(webview2_sdk)
 
 set(WEBVIEW2_INCLUDE_DIR "${webview2_sdk_SOURCE_DIR}/build/native/include")

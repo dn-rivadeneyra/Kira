@@ -26,6 +26,9 @@ third_party/*.zip
 *.exe
 *.dll
 
+# Packages
+*.nupkg
+
 # IDE & OS
 .vscode/
 .idea/

@@ -6,17 +6,43 @@
 
 ## Architecture Overview
 
-Kira enforces clean separation of concerns, process event loop ownership, and thread safety across its components:
+Kira enforces a strict private platform boundary separating core logic from platform-specific WebView and windowing APIs:
 
-- **`App`**: Process event loop owner, readiness manager, production `ShutdownGate` coordinator, `AppShutdownCoordinator`, and process lifecycle controller.
-- **`CommandRegistry`**: Command handler store validating names against `[A-Za-z][A-Za-z0-9_.-]{0,127}` manually without regex.
-- **`ProtocolCodec`**: Version 1 protocol parser and serializer emitting discriminated results (`type: "invoke"`, `type: "result"`, `type: "protocol_error"`).
-- **`CommandExecutor`**: Command dispatcher masking native exceptions to `command_exception` error codes.
-- **`WorkerExecutor`**: Single serial FIFO worker thread executing commands off the UI thread with clean joining shutdown.
-- **`InvocationPipeline`**: Private platform-independent pipeline orchestrating parsing, execution, and response delivery.
-- **`SecurityPolicy`**: Origin normalization using Windows `CreateUri` / `IUri` API.
-- **`WebViewTransport`**: Transactional asynchronous raw UTF-8 IPC transport, native bootstrap script installer with completion callback confirmation, and top-level `WebMessageReceived` event handler.
-- **`NativeWindow`**: Win32 window manager dispatching UI-thread responses (`WM_USER + 100`), managing `InitializationGate` document readiness completion, and deferring window close requests (`WM_CLOSE`) to `AppImpl`.
+```text
+Public Kira API
+       │
+       ▼
+Platform-independent AppImpl
+       │
+       ▼
+Private platform::AppHost interface
+       │
+       ▼
+WindowsAppHost
+       │
+       ├── NativeWindow
+       ├── WebViewTransport
+       ├── SecurityPolicy
+       └── Win32 event loop
+```
+
+### Key Components
+
+- **`kira_core`**: Platform-independent static library.
+  - **`AppImpl`**: Core coordinator managing `AppConfig`, `CommandRegistry`, `WorkerExecutor`, `InvocationPipeline`, `AppShutdownCoordinator`, and interacting strictly via the private `platform::AppHost` interface.
+  - **`CommandRegistry`**: Command handler store validating names against `[A-Za-z][A-Za-z0-9_.-]{0,127}`.
+  - **`ProtocolCodec`**: Version 1 protocol parser and serializer emitting discriminated results (`type: "invoke"`, `type: "result"`, `type: "protocol_error"`).
+  - **`CommandExecutor`**: Command dispatcher masking native exceptions to `command_exception` error codes.
+  - **`WorkerExecutor`**: Single serial FIFO worker thread executing commands off the UI thread with clean joining shutdown.
+  - **`InvocationPipeline`**: Platform-independent pipeline orchestrating message parsing, command execution, and response delivery.
+  - **`AppShutdownCoordinator`**: Production shutdown coordinator enforcing idempotent, single-pass pipeline and worker shutdown.
+- **`kira_platform`**: Native platform backend library (Windows implementation).
+  - **`platform::AppHost`**: Private platform abstraction interface exposing Kira lifecycle operations (`start`, `post_message`, `show`, `request_close`, `run_event_loop`).
+  - **`WindowsAppHost`**: Concrete Windows implementation owning `NativeWindow`, `WebViewTransport`, `SecurityPolicy`, and the Win32 message loop.
+  - **`SecurityPolicy`**: Origin normalization using Windows `CreateUri` / `IUri` API.
+  - **`WebViewTransport`**: Transactional asynchronous raw UTF-8 IPC transport and top-level `WebMessageReceived` event handler.
+  - **`NativeWindow`**: Win32 window manager dispatching UI-thread responses (`WM_USER + 100`) and managing `InitializationGate` document readiness.
+- **`kira`**: Public library exposing `kira::App`, `kira::AppConfig`, and `kira::WindowConfig`.
 
 ---
 
@@ -37,11 +63,11 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
 
 ## Prerequisites & Dependencies
 
-- **Supported Platform**: Windows only (Win32 API + Microsoft WebView2 Runtime).
+- **Supported Platform**: Windows only (Win32 API + Microsoft WebView2 Runtime). Windows is currently the only implemented backend; the platform boundary is prepared for future macOS and Linux backends.
 - **Toolchain**: C++23 compiler (MSVC 2022/2026 v143+) and CMake 3.25+.
 - **Automated Dependencies**:
-  - `nlohmann/json` `v3.11.3` (acquired via CMake `FetchContent` with TLS verification and SHA-256 URL_HASH validation).
-  - `Microsoft.Web.WebView2` `1.0.2903.40` SDK (acquired via CMake `FetchContent` with TLS verification and build artifact validation for `WebView2.h`, `WebView2Loader.dll.lib`, and `WebView2Loader.dll`).
+  - `nlohmann/json` `v3.11.3` (acquired via CMake `FetchContent` with SHA-256 validation).
+  - `Microsoft.Web.WebView2` `1.0.2903.40` SDK (acquired via CMake `FetchContent` with build artifact validation for `WebView2.h`, `WebView2Loader.dll.lib`, and `WebView2Loader.dll`).
 
 ---
 
@@ -52,7 +78,7 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
    cmake -B build -S .
    ```
 
-2. **Compile Core Library, Tests, and Example**:
+2. **Compile Core Library, Platform Backend, Tests, and Example**:
    ```cmd
    cmake --build build --config Debug
    ```
@@ -61,7 +87,7 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
    ```cmd
    ctest --test-dir build -C Debug --output-on-failure
    ```
-   *(Runs platform-independent `test_protocol`, `test_registry`, `test_executor`, `test_security`, `pipeline_tests`, and `test_lifecycle` without requiring a visible WebView2 session).*
+   *(Runs platform-independent tests `test_protocol`, `test_registry`, `test_executor`, `pipeline_tests`, `test_lifecycle`, and `test_app_host` with a fake host, as well as `test_security`, without requiring a visible WebView2 session).*
 
 4. **Run Windows Example Application**:
    ```cmd
@@ -130,5 +156,5 @@ async function greetUser() {
 ## Current Framework Boundaries
 
 - **Single Window**: The public API supports one primary window per `App` instance.
-- **Windows Only**: macOS and Linux backends are out of scope.
+- **Windows Only**: Windows is currently the only supported platform. Non-Windows CMake configurations fail with an explicit message.
 - **Serial Execution**: Native commands execute sequentially on a single FIFO worker thread.

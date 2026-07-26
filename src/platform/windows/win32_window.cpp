@@ -433,13 +433,6 @@ void NativeWindow::show() {
     }
 }
 
-void NativeWindow::hide() {
-    if (!check_ui_thread()) return;
-    if (hwnd_) {
-        ShowWindow(hwnd_, SW_HIDE);
-    }
-}
-
 void NativeWindow::post_ui_response(const std::string& response_json) {
     if (!hwnd_ || !win_state_ || !win_state_->alive.load()) return;
     {

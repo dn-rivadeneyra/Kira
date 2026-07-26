@@ -81,7 +81,6 @@ public:
 
     bool initialize();
     void show();
-    void hide();
     void close();
 
     HRESULT navigate();
@@ -89,15 +88,10 @@ public:
     // Instance response queue posting (no global state)
     void post_ui_response(const std::string& response_json);
 
-    WebViewTransport* transport() { return transport_.get(); }
     HWND get_hwnd() const { return hwnd_; }
 
     bool is_ui_thread() const {
         return GetCurrentThreadId() == ui_thread_id_;
-    }
-
-    InitializationGate& init_gate() {
-        return win_state_->init_gate;
     }
 
 private:
