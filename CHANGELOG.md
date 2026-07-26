@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added platform-independent unit test suite `test_app_host.cpp` exercising `AppImpl` coordination with a fake `AppHost`.
 
 ### Fixed
+- Enforced strict `event_loop_thread_id_ != 0` check in `WindowsAppHost::post_quit`, returning `false` and logging error when event loop thread ID is uninitialized.
 - Applied `post_quit` hardening patch (`kira_post_quit_fix.zip`).
 - `WindowsAppHost::post_quit` now returns `bool` and checks `PostThreadMessage(WM_QUIT)` result, logging diagnostic errors with `GetLastError()` upon failure.
 - Added explicit error logging across all host message and event loop quit fallback paths.

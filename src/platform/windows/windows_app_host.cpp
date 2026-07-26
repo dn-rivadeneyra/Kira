@@ -44,8 +44,14 @@ bool WindowsAppHost::post_host_message(UINT message) {
 }
 
 bool WindowsAppHost::post_quit(int exit_code) {
-    if (event_loop_thread_id_ == 0 ||
-        GetCurrentThreadId() == event_loop_thread_id_) {
+    if (event_loop_thread_id_ == 0) {
+        std::cerr
+            << "[Kira App Error] Cannot post quit: event loop thread is unknown."
+            << std::endl;
+        return false;
+    }
+
+    if (GetCurrentThreadId() == event_loop_thread_id_) {
         // PostQuitMessage has no failure return value and targets the current
         // thread, which is the host event-loop thread in this branch.
         PostQuitMessage(exit_code);
