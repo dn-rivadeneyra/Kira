@@ -32,6 +32,7 @@ struct WindowAsyncState {
     InitializationGate init_gate;
     EventRegistrationToken nav_completed_token{};
     std::atomic<bool> closed{false};
+    std::atomic<bool> security_failure_reported{false};
 
     void complete_initialization(bool success) {
         if (!init_gate.complete(success)) {
@@ -111,8 +112,6 @@ private:
     CloseRequestedCallback on_close_requested_;
     HWND hwnd_{nullptr};
 
-    Microsoft::WRL::ComPtr<ICoreWebView2Controller> webview_controller_;
-    Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
     std::shared_ptr<WebViewTransport> transport_;
 
     std::shared_ptr<WindowAsyncState> win_state_;

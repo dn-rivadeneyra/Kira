@@ -67,24 +67,26 @@ void NativeWindow::close() {
         transport_.reset();
     }
 
-    if (webview_ && win_state_ && win_state_->nav_completed_token.value != 0) {
-        HRESULT hr = webview_->remove_NavigationCompleted(win_state_->nav_completed_token);
+    // WindowAsyncState is the sole owner of the asynchronously-created
+    // WebView and controller. Do not maintain unsynchronized duplicate owners.
+    if (win_state_ && win_state_->webview && win_state_->nav_completed_token.value != 0) {
+        HRESULT hr = win_state_->webview->remove_NavigationCompleted(win_state_->nav_completed_token);
         if (FAILED(hr)) {
             std::cerr << "[Kira Window Error] remove_NavigationCompleted failed, hr=0x" << std::hex << hr << std::endl;
         }
         win_state_->nav_completed_token.value = 0;
     }
 
-    if (webview_controller_) {
-        HRESULT hr = webview_controller_->Close();
+    if (win_state_ && win_state_->webview_controller) {
+        HRESULT hr = win_state_->webview_controller->Close();
         if (FAILED(hr)) {
-            std::cerr << "[Kira Window Error] webview_controller_->Close failed, hr=0x" << std::hex << hr << std::endl;
+            std::cerr << "[Kira Window Error] WebView2 controller Close failed, hr=0x" << std::hex << hr << std::endl;
         }
-        webview_controller_ = nullptr;
+        win_state_->webview_controller.Reset();
     }
 
-    if (webview_) {
-        webview_ = nullptr;
+    if (win_state_) {
+        win_state_->webview.Reset();
     }
 
     if (hwnd_) {
@@ -221,8 +223,24 @@ bool NativeWindow::initialize() {
             if (!state || !state->alive.load()) {
                 return;
             }
+
+            // A security-critical transport failure is terminal. Report it once, then route it according to current lifecycle phase.
+            if (state->security_failure_reported.exchange(true)) {
+                return;
+            }
+
             std::cerr << "[Kira Security Critical] Transport security failure, hr=0x" << std::hex << security_hr << std::endl;
-            state->complete_initialization(false);
+
+            if (!state->init_gate.is_completed()) {
+                // Startup has not completed: fail initialization.
+                state->complete_initialization(false);
+                return;
+            }
+
+            // The app is already running. Request application-owned deferred shutdown instead of trying to reuse completed init gate.
+            if (state->on_close_requested) {
+                state->on_close_requested();
+            }
         }
     );
 
