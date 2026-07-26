@@ -1,6 +1,7 @@
 #include "src/platform/windows/win32_window.hpp"
 #include "src/platform/windows/security.hpp"
 #include <iostream>
+#include <cassert>
 
 namespace kira {
 
@@ -30,7 +31,12 @@ NativeWindow::NativeWindow(
       on_message_(std::move(on_message)),
       on_init_(std::move(on_init)),
       on_close_requested_(std::move(on_close_requested)),
-      lifetime_(std::make_shared<CallbackLifetime>()) {}
+      state_(std::make_shared<WindowCallbackState>()),
+      ui_thread_id_(GetCurrentThreadId()) {
+    state_->on_init = on_init_;
+    state_->on_close_requested = on_close_requested_;
+    state_->ui_thread_id = ui_thread_id_;
+}
 
 NativeWindow::~NativeWindow() {
     close();
@@ -38,12 +44,11 @@ NativeWindow::~NativeWindow() {
 
 void NativeWindow::close() {
     if (closed_.exchange(true)) {
-        return; // Idempotent return if already closed
+        return; // Idempotent return
     }
 
-    if (lifetime_) {
-        lifetime_->alive.store(false);
-        lifetime_.reset();
+    if (state_) {
+        state_->alive.store(false);
     }
 
     if (transport_) {
@@ -52,14 +57,17 @@ void NativeWindow::close() {
     }
 
     if (webview_ && nav_completed_token_.value != 0) {
-        webview_->remove_NavigationCompleted(nav_completed_token_);
+        HRESULT hr = webview_->remove_NavigationCompleted(nav_completed_token_);
+        if (FAILED(hr)) {
+            std::cerr << "[Kira Window Error] remove_NavigationCompleted failed, hr=0x" << std::hex << hr << std::endl;
+        }
         nav_completed_token_.value = 0;
     }
 
     if (webview_controller_) {
         HRESULT hr = webview_controller_->Close();
         if (FAILED(hr)) {
-            std::cerr << "[Kira Window] webview_controller_->Close failed, hr=0x" << std::hex << hr << std::endl;
+            std::cerr << "[Kira Window Error] webview_controller_->Close failed, hr=0x" << std::hex << hr << std::endl;
         }
         webview_controller_ = nullptr;
     }
@@ -73,6 +81,11 @@ void NativeWindow::close() {
         hwnd_ = nullptr;
     }
 
+    if (state_) {
+        state_->hwnd = nullptr;
+        state_.reset();
+    }
+
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         response_queue_.clear();
@@ -80,21 +93,28 @@ void NativeWindow::close() {
 }
 
 void NativeWindow::complete_initialization(bool success) {
-    InitializationResult expected = InitializationResult::pending;
-    InitializationResult desired = success ? InitializationResult::succeeded : InitializationResult::failed;
-
-    if (!init_result_.compare_exchange_strong(expected, desired)) {
-        return; // One-shot guard: first call wins, subsequent calls ignored
+    // Production InitializationGate (one-shot state machine)
+    if (!init_gate_.complete(success)) {
+        return; // First completion call wins; subsequent calls ignored
     }
 
-    // Remove initialization-only NavigationCompleted handler
+    // Unsubscribe initialization NavigationCompleted event handler
     if (webview_ && nav_completed_token_.value != 0) {
         webview_->remove_NavigationCompleted(nav_completed_token_);
         nav_completed_token_.value = 0;
     }
 
     if (hwnd_) {
-        PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, success ? 1 : 0, 0);
+        BOOL posted = PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, success ? 1 : 0, 0);
+        if (!posted) {
+            std::cerr << "[Kira Window Error] PostMessage(WM_KIRA_INIT_COMPLETE) failed, err=" << GetLastError() << std::endl;
+            // Fallback synchronous notification if PostMessage fails
+            if (on_init_) {
+                on_init_(success);
+            }
+        }
+    } else if (on_init_) {
+        on_init_(success);
     }
 }
 
@@ -140,13 +160,15 @@ LRESULT CALLBACK NativeWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 }
 
 void NativeWindow::drain_response_queue() {
+    assert(is_ui_thread() && "drain_response_queue must run on UI thread");
+
     std::vector<std::string> pending;
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         std::swap(pending, response_queue_);
     }
 
-    if (transport_ && transport_->is_ready() && lifetime_ && lifetime_->alive.load()) {
+    if (transport_ && transport_->is_ready() && state_ && state_->alive.load()) {
         for (const auto& resp : pending) {
             transport_->send_message(resp);
         }
@@ -154,6 +176,8 @@ void NativeWindow::drain_response_queue() {
 }
 
 bool NativeWindow::initialize() {
+    assert(is_ui_thread() && "NativeWindow::initialize must run on UI thread");
+
     HINSTANCE hInstance = GetModuleHandle(NULL);
 
     WNDCLASSEXW wc = {};
@@ -197,15 +221,16 @@ bool NativeWindow::initialize() {
         return false;
     }
 
+    state_->hwnd = hwnd_;
     transport_ = std::make_unique<WebViewTransport>(config_, on_message_);
 
     // Initialize WebView2 Environment asynchronously
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, nullptr, nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this, weak_life = std::weak_ptr<CallbackLifetime>(lifetime_)](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                auto life = weak_life.lock();
-                if (!life || !life->alive.load()) return S_OK;
+            [this, weak_state = std::weak_ptr<WindowCallbackState>(state_)](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                auto st = weak_state.lock();
+                if (!st || !st->alive.load()) return S_OK;
 
                 if (FAILED(result) || !env) {
                     std::cerr << "[Kira Error] CreateCoreWebView2EnvironmentWithOptions failed, hr=0x" << std::hex << result << std::endl;
@@ -216,9 +241,9 @@ bool NativeWindow::initialize() {
                 HRESULT hr_ctrl = env->CreateCoreWebView2Controller(
                     hwnd_,
                     Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this, weak_life](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
-                            auto life2 = weak_life.lock();
-                            if (!life2 || !life2->alive.load()) return S_OK;
+                        [this, weak_state](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                            auto st2 = weak_state.lock();
+                            if (!st2 || !st2->alive.load()) return S_OK;
 
                             if (FAILED(res) || !controller) {
                                 std::cerr << "[Kira Error] CreateCoreWebView2Controller failed, hr=0x" << std::hex << res << std::endl;
@@ -266,58 +291,64 @@ bool NativeWindow::initialize() {
                                 }
                             }
 
-                            if (!transport_->attach(webview_.Get())) {
-                                std::cerr << "[Kira Error] Failed to attach transport to WebView2." << std::endl;
-                                complete_initialization(false);
-                                return E_FAIL;
-                            }
+                            // Asynchronous attach: transport attachment continues only after bootstrap registration completes
+                            transport_->attach(webview_.Get(), [this, weak_state](HRESULT attach_hr) {
+                                auto st3 = weak_state.lock();
+                                if (!st3 || !st3->alive.load()) return;
 
-                            // Register NavigationCompleted handler for initial document validation
-                            HRESULT hr_nav = webview_->add_NavigationCompleted(
-                                Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [this, weak_life](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
-                                        auto life3 = weak_life.lock();
-                                        if (!life3 || !life3->alive.load() || !args) return S_OK;
+                                if (FAILED(attach_hr)) {
+                                    std::cerr << "[Kira Error] Asynchronous transport attach failed, hr=0x" << std::hex << attach_hr << std::endl;
+                                    complete_initialization(false);
+                                    return;
+                                }
 
-                                        BOOL is_success = FALSE;
-                                        if (FAILED(args->get_IsSuccess(&is_success)) || !is_success) {
-                                            std::cerr << "[Kira Error] WebView2 initial navigation failed or was cancelled." << std::endl;
-                                            complete_initialization(false);
+                                // Register initial NavigationCompleted handler
+                                HRESULT hr_nav = webview_->add_NavigationCompleted(
+                                    Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                                        [this, weak_state](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                                            auto st4 = weak_state.lock();
+                                            if (!st4 || !st4->alive.load() || !args) return S_OK;
+
+                                            BOOL is_success = FALSE;
+                                            if (FAILED(args->get_IsSuccess(&is_success)) || !is_success) {
+                                                std::cerr << "[Kira Error] WebView2 initial navigation failed or was cancelled." << std::endl;
+                                                complete_initialization(false);
+                                                return S_OK;
+                                            }
+
+                                            PWSTR source_raw = nullptr;
+                                            std::string loaded_uri;
+                                            if (SUCCEEDED(webview_->get_Source(&source_raw)) && source_raw) {
+                                                loaded_uri = wstring_to_string(source_raw);
+                                                CoTaskMemFree(source_raw);
+                                            }
+
+                                            if (loaded_uri.empty() || !SecurityPolicy::is_approved_origin(loaded_uri, config_)) {
+                                                std::cerr << "[Kira Security] Loaded document source is invalid or unapproved: " << loaded_uri << std::endl;
+                                                complete_initialization(false);
+                                                return S_OK;
+                                            }
+
+                                            // Signal initialization success only after approved initial document has loaded
+                                            complete_initialization(true);
                                             return S_OK;
-                                        }
+                                        }).Get(),
+                                    &nav_completed_token_
+                                );
 
-                                        PWSTR source_raw = nullptr;
-                                        std::string loaded_uri;
-                                        if (SUCCEEDED(webview_->get_Source(&source_raw)) && source_raw) {
-                                            loaded_uri = wstring_to_string(source_raw);
-                                            CoTaskMemFree(source_raw);
-                                        }
+                                if (FAILED(hr_nav)) {
+                                    std::cerr << "[Kira Error] add_NavigationCompleted failed, hr=0x" << std::hex << hr_nav << std::endl;
+                                    complete_initialization(false);
+                                    return;
+                                }
 
-                                        if (loaded_uri.empty() || !SecurityPolicy::is_approved_origin(loaded_uri, config_)) {
-                                            std::cerr << "[Kira Security] Loaded document source is invalid or unapproved: " << loaded_uri << std::endl;
-                                            complete_initialization(false);
-                                            return S_OK;
-                                        }
-
-                                        // Signal initialization success only after initial top-level document has loaded & passed validation
-                                        complete_initialization(true);
-                                        return S_OK;
-                                    }).Get(),
-                                &nav_completed_token_
-                            );
-
-                            if (FAILED(hr_nav)) {
-                                std::cerr << "[Kira Error] add_NavigationCompleted failed, hr=0x" << std::hex << hr_nav << std::endl;
-                                complete_initialization(false);
-                                return hr_nav;
-                            }
-
-                            HRESULT hr_start_nav = navigate();
-                            if (FAILED(hr_start_nav)) {
-                                std::cerr << "[Kira Error] Navigate failed synchronously, hr=0x" << std::hex << hr_start_nav << std::endl;
-                                complete_initialization(false);
-                                return hr_start_nav;
-                            }
+                                // Navigate only after bootstrap & transport setup complete asynchronously
+                                HRESULT hr_start_nav = navigate();
+                                if (FAILED(hr_start_nav)) {
+                                    std::cerr << "[Kira Error] Navigate failed synchronously, hr=0x" << std::hex << hr_start_nav << std::endl;
+                                    complete_initialization(false);
+                                }
+                            });
 
                             return S_OK;
                         }).Get()
@@ -341,6 +372,7 @@ bool NativeWindow::initialize() {
 }
 
 HRESULT NativeWindow::navigate() {
+    assert(is_ui_thread() && "NativeWindow::navigate must run on UI thread");
     if (!webview_) return E_POINTER;
 
     HRESULT hr = S_OK;
@@ -354,14 +386,22 @@ HRESULT NativeWindow::navigate() {
 }
 
 void NativeWindow::resize_webview() {
+    assert(is_ui_thread() && "resize_webview must run on UI thread");
     if (webview_controller_ && hwnd_) {
         RECT bounds;
-        GetClientRect(hwnd_, &bounds);
-        webview_controller_->put_Bounds(bounds);
+        if (!GetClientRect(hwnd_, &bounds)) {
+            std::cerr << "[Kira Window Error] GetClientRect failed, err=" << GetLastError() << std::endl;
+            return;
+        }
+        HRESULT hr = webview_controller_->put_Bounds(bounds);
+        if (FAILED(hr)) {
+            std::cerr << "[Kira Window Error] put_Bounds failed, hr=0x" << std::hex << hr << std::endl;
+        }
     }
 }
 
 void NativeWindow::show() {
+    assert(is_ui_thread() && "show must run on UI thread");
     if (hwnd_) {
         ShowWindow(hwnd_, SW_SHOW);
         UpdateWindow(hwnd_);
@@ -369,18 +409,22 @@ void NativeWindow::show() {
 }
 
 void NativeWindow::hide() {
+    assert(is_ui_thread() && "hide must run on UI thread");
     if (hwnd_) {
         ShowWindow(hwnd_, SW_HIDE);
     }
 }
 
 void NativeWindow::post_ui_response(const std::string& response_json) {
-    if (!hwnd_ || !lifetime_ || !lifetime_->alive.load()) return;
+    if (!hwnd_ || !state_ || !state_->alive.load()) return;
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         response_queue_.push_back(response_json);
     }
-    PostMessage(hwnd_, WM_KIRA_IPC_RESPONSE, 0, 0);
+    BOOL posted = PostMessage(hwnd_, WM_KIRA_IPC_RESPONSE, 0, 0);
+    if (!posted) {
+        std::cerr << "[Kira Window Error] PostMessage(WM_KIRA_IPC_RESPONSE) failed, err=" << GetLastError() << std::endl;
+    }
 }
 
 } // namespace kira

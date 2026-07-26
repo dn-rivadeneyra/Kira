@@ -3,29 +3,27 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kira Example</title>
+    <title>Kira Desktop Example</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="container">
-        <h1>Kira Framework Example</h1>
+        <header>
+            <div class="logo">⚡ KIRA</div>
+            <p class="subtitle">C++23 Native Desktop Framework</p>
+        </header>
 
-        <section class="section">
-            <h2>Command: greet</h2>
-            <div class="controls">
-                <input type="text" id="name-input" value="Alice" />
-                <button id="greet-btn">Invoke greet</button>
-            </div>
-            <pre id="greet-result" class="result"></pre>
-        </section>
-
-        <section class="section">
-            <h2>Command: unknown_cmd (Error Handling)</h2>
-            <div class="controls">
-                <button id="unknown-btn">Invoke unknown_cmd</button>
-            </div>
-            <pre id="unknown-result" class="result"></pre>
-        </section>
+        <main>
+            <section class="card">
+                <h2>Native Command Test</h2>
+                <div class="input-group">
+                    <input type="text" id="name-input" placeholder="Enter your name" value="World">
+                    <button id="greet-btn">Greet</button>
+                </div>
+                <div id="output" class="output-box">Response will appear here...</div>
+                <a id="iframe-test-link" href="iframe_test.html" style="color:#38bdf8; margin-top:1.5rem; display:inline-block; font-size:0.9rem;">Open Iframe Security Smoke Test →</a>
+            </section>
+        </main>
     </div>
 
     <script type="module" src="main.js"></script>

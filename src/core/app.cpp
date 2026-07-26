@@ -1,5 +1,6 @@
 #include "kira/app.hpp"
 #include "src/core/types.hpp"
+#include "src/core/gates.hpp"
 #include "src/core/registry.hpp"
 #include "src/core/protocol.hpp"
 #include "src/core/executor.hpp"
@@ -53,7 +54,12 @@ public:
                 // Window close requested callback (WM_CLOSE).
                 // Posts deferred application shutdown message to Win32 message queue so WndProc returns safely first.
                 if (window_ && window_->get_hwnd()) {
-                    PostMessage(window_->get_hwnd(), WM_KIRA_APP_SHUTDOWN, 0, 0);
+                    BOOL posted = PostMessage(window_->get_hwnd(), WM_KIRA_APP_SHUTDOWN, 0, 0);
+                    if (!posted) {
+                        std::cerr << "[Kira App Error] PostMessage(WM_KIRA_APP_SHUTDOWN) failed, err=" << GetLastError() << std::endl;
+                        // Fallback thread message if window PostMessage fails
+                        PostThreadMessage(GetCurrentThreadId(), WM_KIRA_APP_SHUTDOWN, 0, 0);
+                    }
                 }
             }
         );
@@ -103,8 +109,9 @@ public:
     }
 
     void shutdown() {
-        if (shutdown_requested_.exchange(true)) {
-            return; // Idempotent guard: first shutdown request wins, subsequent calls ignored
+        // Production ShutdownGate (one-shot state machine)
+        if (!shutdown_gate_.request()) {
+            return; // First shutdown request returns true; subsequent requests return false
         }
 
         // 1. Mark app as closing and stop accepting new IPC requests
@@ -127,10 +134,12 @@ public:
         state_ = ReadinessState::closed;
     }
 
+    ShutdownGate& shutdown_gate() { return shutdown_gate_; }
+
 private:
     AppConfig config_;
     std::atomic<ReadinessState> state_{ReadinessState::created};
-    std::atomic<bool> shutdown_requested_{false};
+    ShutdownGate shutdown_gate_;
     CommandRegistry registry_;
     WorkerExecutor worker_;
     InvocationPipeline pipeline_;

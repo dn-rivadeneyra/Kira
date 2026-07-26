@@ -10,6 +10,7 @@
 #include <mutex>
 #include <atomic>
 #include "kira/app.hpp"
+#include "src/core/gates.hpp"
 #include "src/platform/windows/webview_transport.hpp"
 
 namespace kira {
@@ -18,10 +19,12 @@ constexpr UINT WM_KIRA_IPC_RESPONSE   = WM_USER + 100;
 constexpr UINT WM_KIRA_INIT_COMPLETE  = WM_USER + 101;
 constexpr UINT WM_KIRA_APP_SHUTDOWN   = WM_USER + 102;
 
-enum class InitializationResult {
-    pending,
-    succeeded,
-    failed
+struct WindowCallbackState {
+    std::atomic_bool alive{true};
+    DWORD ui_thread_id{0};
+    HWND hwnd{nullptr};
+    std::function<void(bool success)> on_init;
+    std::function<void()> on_close_requested;
 };
 
 class NativeWindow {
@@ -55,6 +58,12 @@ public:
     WebViewTransport* transport() { return transport_.get(); }
     HWND get_hwnd() const { return hwnd_; }
 
+    bool is_ui_thread() const {
+        return GetCurrentThreadId() == ui_thread_id_;
+    }
+
+    InitializationGate& init_gate() { return init_gate_; }
+
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     void resize_webview();
@@ -72,9 +81,10 @@ private:
     std::unique_ptr<WebViewTransport> transport_;
 
     EventRegistrationToken nav_completed_token_{};
-    std::shared_ptr<CallbackLifetime> lifetime_;
+    std::shared_ptr<WindowCallbackState> state_;
+    DWORD ui_thread_id_{0};
 
-    std::atomic<InitializationResult> init_result_{InitializationResult::pending};
+    InitializationGate init_gate_;
     std::atomic<bool> closed_{false};
 
     // Instance-owned response queue and mutex

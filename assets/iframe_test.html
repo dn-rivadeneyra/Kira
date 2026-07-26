@@ -4,29 +4,40 @@
     <meta charset="UTF-8">
     <title>Kira Iframe Security Smoke Test</title>
     <style>
-        body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; }
-        .box { background: #1e293b; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
-        iframe { width: 100%; height: 120px; border: 1px solid #334155; border-radius: 4px; background: #0f172a; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; margin: 0; }
+        .box { background: #1e293b; padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem; border: 1px solid #334155; }
+        iframe { width: 100%; height: 120px; border: 1px solid #475569; border-radius: 6px; background: #0f172a; margin-top: 1rem; }
+        button { background: #3b82f6; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #2563eb; }
+        .pass-tag { color: #4ade80; font-weight: bold; }
+        .fail-tag { color: #f87171; font-weight: bold; }
+        a { color: #38bdf8; text-decoration: none; display: inline-block; margin-bottom: 1rem; }
+        a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
+    <a href="index.html">← Back to Main App</a>
     <h1>Kira Iframe Security Smoke Test</h1>
 
     <div class="box">
-        <h3>Top-Level Invocation Test</h3>
+        <h3>1. Top-Level Document Test</h3>
+        <p>Invocations sent from the top-level document should execute successfully.</p>
         <button id="top-btn">Invoke greet from Top-Level</button>
-        <div id="top-res"></div>
+        <div id="top-res" style="margin-top:0.5rem; color:#cbd5e1;">Awaiting invocation...</div>
     </div>
 
     <div class="box">
-        <h3>Same-Origin Iframe Invocation Test</h3>
+        <h3>2. Same-Origin Iframe Test</h3>
+        <p>Invocations attempted from inside an iframe should NOT reach the native host.</p>
+        <div id="status-display" class="pass-tag">Status: PASS (No frame-1 response received)</div>
         <iframe id="test-iframe" srcdoc="
             <!DOCTYPE html>
             <html>
-            <body style='color:#94a3b8; font-family:sans-serif; padding:10px;'>
-                <p>Iframe Content</p>
-                <button onclick='window.chrome.webview.postMessage(JSON.stringify({version:1,type:&quot;invoke&quot;,id:&quot;frame-1&quot;,command:&quot;greet&quot;,payload:{name:&quot;Iframe&quot;}}))'>
-                    Try invoke from Iframe
+            <body style='color:#94a3b8; font-family:sans-serif; padding:10px; margin:0;'>
+                <p style='margin:0 0 10px 0;'>Child Iframe Document</p>
+                <button style='background:#ef4444; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer;'
+                        onclick='window.chrome.webview.postMessage(JSON.stringify({version:1,type:&quot;invoke&quot;,id:&quot;frame-1&quot;,command:&quot;greet&quot;,payload:{name:&quot;Iframe&quot;}}))'>
+                    Try invoke greet from Iframe
                 </button>
             </body>
             </html>
@@ -36,14 +47,32 @@
     <script type="module">
         import { invoke } from './kira.js';
 
+        const topRes = document.getElementById('top-res');
+        const statusDisplay = document.getElementById('status-display');
+
         document.getElementById('top-btn').addEventListener('click', async () => {
             try {
                 const res = await invoke('greet', { name: 'Top-Level' });
-                document.getElementById('top-res').innerText = JSON.stringify(res);
+                topRes.innerText = 'Top-Level Result: ' + JSON.stringify(res);
             } catch (err) {
-                document.getElementById('top-res').innerText = 'Error: ' + err.message;
+                topRes.innerText = 'Top-Level Error: ' + err.message;
             }
         });
+
+        // Page-level observation for frame-1 response
+        if (window.__KIRA_INTERNAL__) {
+            window.__KIRA_INTERNAL__.onMessage((rawMsg) => {
+                try {
+                    const parsed = JSON.parse(rawMsg);
+                    if (parsed.id === 'frame-1') {
+                        statusDisplay.className = 'fail-tag';
+                        statusDisplay.innerText = 'Status: FAIL (Native command executed for frame-1 request!)';
+                    }
+                } catch (e) {
+                    console.error('[Iframe Smoke Test Error]', e);
+                }
+            });
+        }
     </script>
 </body>
 </html>

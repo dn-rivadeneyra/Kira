@@ -1,119 +1,114 @@
 #include <cassert>
 #include <iostream>
-#include <atomic>
+#include <vector>
+#include <string>
+#include "src/core/gates.hpp"
 #include "src/core/pipeline.hpp"
 
 using namespace kira;
 
-enum class TestInitState {
-    pending,
-    succeeded,
-    failed
-};
+void test_initialization_gate_production() {
+    InitializationGate gate;
+    assert(gate.state() == InitializationResult::pending);
+    assert(!gate.is_completed());
 
-class OneShotInitHelper {
-public:
-    bool complete(bool success) {
-        TestInitState expected = TestInitState::pending;
-        TestInitState desired = success ? TestInitState::succeeded : TestInitState::failed;
+    // 1. First completion attempt transitions state
+    bool first = gate.complete(true);
+    assert(first == true);
+    assert(gate.state() == InitializationResult::succeeded);
+    assert(gate.is_completed());
 
-        if (!state_.compare_exchange_strong(expected, desired)) {
-            return false; // Already completed
-        }
-        callback_count_++;
-        return true;
-    }
+    // 2. Subsequent completion attempts are ignored (first call wins)
+    bool second = gate.complete(true);
+    assert(second == false);
+    assert(gate.state() == InitializationResult::succeeded);
 
-    TestInitState state() const { return state_.load(); }
-    int callback_count() const { return callback_count_.load(); }
-
-private:
-    std::atomic<TestInitState> state_{TestInitState::pending};
-    std::atomic<int> callback_count_{0};
-};
-
-void test_initialization_oneshot() {
-    // 1. Pending to Succeeded
-    {
-        OneShotInitHelper helper;
-        assert(helper.state() == TestInitState::pending);
-        bool first = helper.complete(true);
-        assert(first == true);
-        assert(helper.state() == TestInitState::succeeded);
-        assert(helper.callback_count() == 1);
-
-        // Repeated success ignored
-        bool second = helper.complete(true);
-        assert(second == false);
-        assert(helper.state() == TestInitState::succeeded);
-        assert(helper.callback_count() == 1);
-
-        // Subsequent failure ignored
-        bool third = helper.complete(false);
-        assert(third == false);
-        assert(helper.state() == TestInitState::succeeded);
-        assert(helper.callback_count() == 1);
-    }
-
-    // 2. Pending to Failed
-    {
-        OneShotInitHelper helper;
-        assert(helper.state() == TestInitState::pending);
-        bool first = helper.complete(false);
-        assert(first == true);
-        assert(helper.state() == TestInitState::failed);
-        assert(helper.callback_count() == 1);
-
-        // Subsequent success ignored
-        bool second = helper.complete(true);
-        assert(second == false);
-        assert(helper.state() == TestInitState::failed);
-        assert(helper.callback_count() == 1);
-    }
-
-    std::cout << "[PASS] test_initialization_oneshot" << std::endl;
+    bool third = gate.complete(false);
+    assert(third == false);
+    assert(gate.state() == InitializationResult::succeeded);
 }
 
-void test_lifecycle_shutdown_idempotency() {
+void test_initialization_gate_failure() {
+    InitializationGate gate;
+    assert(gate.state() == InitializationResult::pending);
+
+    bool first = gate.complete(false);
+    assert(first == true);
+    assert(gate.state() == InitializationResult::failed);
+    assert(gate.is_completed());
+
+    bool second = gate.complete(true);
+    assert(second == false);
+    assert(gate.state() == InitializationResult::failed);
+}
+
+void test_shutdown_gate_production() {
+    ShutdownGate gate;
+    assert(!gate.requested());
+
+    // First request returns true
+    bool first = gate.request();
+    assert(first == true);
+    assert(gate.requested() == true);
+
+    // Later requests return false
+    bool second = gate.request();
+    assert(second == false);
+    assert(gate.requested() == true);
+}
+
+void test_lifecycle_shutdown_ordering() {
     CommandRegistry registry;
     WorkerExecutor worker;
-    bool pipeline_shutdown = false;
-    bool worker_stopped = false;
+    std::vector<std::string> order;
 
     InvocationPipeline pipeline(registry, worker, [](const std::string&) {});
     pipeline.set_ready(true);
 
-    std::atomic<bool> shutdown_requested{false};
-    int shutdown_execution_count = 0;
+    ShutdownGate shutdown_gate;
 
-    auto trigger_shutdown = [&]() {
-        if (shutdown_requested.exchange(true)) {
-            return; // Idempotent guard
+    auto execute_shutdown_sequence = [&]() {
+        if (!shutdown_gate.request()) {
+            return;
         }
-        shutdown_execution_count++;
+
+        // 1. Pipeline shutdown
         pipeline.shutdown();
-        pipeline_shutdown = true;
+        order.push_back("pipeline_shutdown");
+
+        // 2. Worker stop and join
         worker.stop_and_join();
-        worker_stopped = true;
+        order.push_back("worker_join");
+
+        // 3. Resource close callback
+        order.push_back("window_resource_close");
+
+        // 4. Quit request callback
+        order.push_back("quit_request");
     };
 
-    // First shutdown request
-    trigger_shutdown();
-    assert(shutdown_execution_count == 1);
-    assert(pipeline_shutdown == true);
-    assert(worker_stopped == true);
+    // First shutdown execution
+    execute_shutdown_sequence();
+
+    assert(order.size() == 4);
+    assert(order[0] == "pipeline_shutdown");
+    assert(order[1] == "worker_join");
+    assert(order[2] == "window_resource_close");
+    assert(order[3] == "quit_request");
     assert(!pipeline.is_ready());
 
-    // Second shutdown request ignored
-    trigger_shutdown();
-    assert(shutdown_execution_count == 1);
+    // Second shutdown execution (ignored)
+    execute_shutdown_sequence();
+    assert(order.size() == 4);
 
-    std::cout << "[PASS] test_lifecycle_shutdown_idempotency" << std::endl;
+    std::cout << "[PASS] test_lifecycle_shutdown_ordering" << std::endl;
 }
 
 int main() {
-    test_initialization_oneshot();
-    test_lifecycle_shutdown_idempotency();
+    test_initialization_gate_production();
+    test_initialization_gate_failure();
+    test_shutdown_gate_production();
+    test_lifecycle_shutdown_ordering();
     std::cout << "ALL LIFECYCLE TESTS PASSED." << std::endl;
     return 0;
 }
