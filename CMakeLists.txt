@@ -1,43 +1,40 @@
 cmake_minimum_required(VERSION 3.25)
-project(Kira VERSION 0.1.0 LANGUAGES CXX)
+project(Kira VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT WIN32)
-    message(WARNING "Kira current vertical slice only supports Windows (Win32 + WebView2).")
+    message(WARNING "Kira currently only supports Windows (Win32 + WebView2).")
 endif()
 
-# Local Third Party Dependencies
-set(JSON_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
-set(WEBVIEW2_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2/build/native/include")
-
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(WEBVIEW2_ARCH "x64")
-elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
-    set(WEBVIEW2_ARCH "x86")
-else()
-    set(WEBVIEW2_ARCH "arm64")
-endif()
-
-set(WEBVIEW2_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2/build/native/${WEBVIEW2_ARCH}")
-set(WEBVIEW2_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2/runtimes/win-${WEBVIEW2_ARCH}/native")
+# Dependencies setup
+include(cmake/Dependencies.cmake)
 
 # Core Kira Library
 add_library(kira STATIC
+    src/core/protocol.cpp
+    src/core/registry.cpp
+    src/core/executor.cpp
+    src/core/worker.cpp
     src/core/app.cpp
-    src/core/ipc.cpp
+    src/platform/windows/security.cpp
+    src/platform/windows/webview_transport.cpp
     src/platform/windows/win32_window.cpp
 )
 
 target_include_directories(kira PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${JSON_INCLUDE_DIR}
+)
+
+target_include_directories(kira PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${WEBVIEW2_INCLUDE_DIR}
 )
 
 target_link_libraries(kira PUBLIC
+    nlohmann_json::nlohmann_json
     "${WEBVIEW2_LIB_DIR}/WebView2Loader.dll.lib"
     user32
     ole32
@@ -51,6 +48,57 @@ if(MSVC)
     target_compile_options(kira PRIVATE /W4 /permissive- /utf-8)
 endif()
 
+# Automated Testing Suite
+enable_testing()
+
+# 1. Protocol Unit Test Target
+add_executable(kira_test_protocol
+    tests/unit/test_protocol.cpp
+    src/core/protocol.cpp
+)
+target_include_directories(kira_test_protocol PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kira_test_protocol PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME test_protocol COMMAND kira_test_protocol)
+
+# 2. Registry Unit Test Target
+add_executable(kira_test_registry
+    tests/unit/test_registry.cpp
+    src/core/registry.cpp
+)
+target_include_directories(kira_test_registry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kira_test_registry PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME test_registry COMMAND kira_test_registry)
+
+# 3. Executor Unit Test Target
+add_executable(kira_test_executor
+    tests/unit/test_executor.cpp
+    src/core/registry.cpp
+    src/core/executor.cpp
+    src/core/worker.cpp
+)
+target_include_directories(kira_test_executor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kira_test_executor PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME test_executor COMMAND kira_test_executor)
+
+# Pipeline Integration Test Target (Platform-Independent using FakeTransport)
+add_executable(kira_pipeline_tests
+    tests/integration/test_pipeline.cpp
+    src/core/protocol.cpp
+    src/core/registry.cpp
+    src/core/executor.cpp
+    src/core/worker.cpp
+)
+
+target_include_directories(kira_pipeline_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(kira_pipeline_tests PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
+add_test(NAME pipeline_tests COMMAND kira_pipeline_tests)
+
 # Example Application
 add_executable(kira_example WIN32
     examples/main.cpp
@@ -58,7 +106,7 @@ add_executable(kira_example WIN32
 
 target_link_libraries(kira_example PRIVATE kira)
 
-# Copy WebView2Loader.dll next to executable
+# Copy WebView2Loader.dll to build output directory
 add_custom_command(TARGET kira_example POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${WEBVIEW2_DLL_DIR}/WebView2Loader.dll"
@@ -66,10 +114,13 @@ add_custom_command(TARGET kira_example POST_BUILD
     COMMENT "Copying WebView2Loader.dll to build directory"
 )
 
-# Copy web assets next to executable
+# Copy web assets AND single canonical packages/api/kira.js to target build directory
 add_custom_command(TARGET kira_example POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets"
         "$<TARGET_FILE_DIR:kira_example>/assets"
-    COMMENT "Copying web assets to target build directory"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/packages/api/kira.js"
+        "$<TARGET_FILE_DIR:kira_example>/assets/kira.js"
+    COMMENT "Copying web assets and canonical kira.js to build directory"
 )

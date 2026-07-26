@@ -1,12 +1,11 @@
-#include "win32_window.hpp"
-#include <filesystem>
+#include "src/platform/windows/win32_window.hpp"
+#include "src/platform/windows/security.hpp"
 #include <iostream>
-#include <sstream>
-#include <shlwapi.h>
+#include <vector>
+#include <mutex>
 
 namespace kira {
 
-// Helper string conversion functions
 static std::wstring string_to_wstring(const std::string& str) {
     if (str.empty()) return L"";
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
@@ -15,33 +14,28 @@ static std::wstring string_to_wstring(const std::string& str) {
     return wstr;
 }
 
-static std::string wstring_to_string(const std::wstring& wstr) {
-    if (wstr.empty()) return "";
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
-    std::string str(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &str[0], size_needed, NULL, NULL);
-    return str;
+// Queue for pending IPC responses posted to Win32 UI thread
+static std::mutex g_response_queue_mutex;
+static std::vector<std::string> g_pending_responses;
+
+NativeWindow::NativeWindow(const WindowConfig& config, RawMessageCallback on_message, InitCallback on_init)
+    : config_(config), on_message_(std::move(on_message)), on_init_(std::move(on_init)) {}
+
+NativeWindow::~NativeWindow() {
+    close();
 }
 
-// NativeWindow implementation wrapper
-NativeWindow::NativeWindow(const WindowConfig& config)
-    : impl_(std::make_unique<NativeWindowImpl>(config)) {}
-
-NativeWindow::~NativeWindow() = default;
-
-bool NativeWindow::initialize() { return impl_->initialize(); }
-void NativeWindow::show() { impl_->show(); }
-void NativeWindow::post_web_message(const std::string& message) { impl_->post_web_message(message); }
-void NativeWindow::set_on_web_message(MessageCallback callback) { impl_->set_on_web_message(std::move(callback)); }
-void* NativeWindow::get_native_handle() const { return static_cast<void*>(impl_->get_hwnd()); }
-
-// NativeWindowImpl Win32 + WebView2 implementation
-NativeWindowImpl::NativeWindowImpl(const WindowConfig& config)
-    : config_(config) {}
-
-NativeWindowImpl::~NativeWindowImpl() {
-    if (webview_ && web_message_token_.value != 0) {
-        webview_->remove_WebMessageReceived(web_message_token_);
+void NativeWindow::close() {
+    if (transport_) {
+        transport_->detach();
+        transport_.reset();
+    }
+    if (webview_controller_) {
+        webview_controller_->Close();
+        webview_controller_ = nullptr;
+    }
+    if (webview_) {
+        webview_ = nullptr;
     }
     if (hwnd_) {
         DestroyWindow(hwnd_);
@@ -49,14 +43,14 @@ NativeWindowImpl::~NativeWindowImpl() {
     }
 }
 
-LRESULT CALLBACK NativeWindowImpl::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    NativeWindowImpl* self = nullptr;
+LRESULT CALLBACK NativeWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    NativeWindow* self = nullptr;
     if (uMsg == WM_NCCREATE) {
         CREATESTRUCT* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
-        self = reinterpret_cast<NativeWindowImpl*>(cs->lpCreateParams);
+        self = reinterpret_cast<NativeWindow*>(cs->lpCreateParams);
         SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     } else {
-        self = reinterpret_cast<NativeWindowImpl*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+        self = reinterpret_cast<NativeWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
     }
 
     if (self) {
@@ -64,15 +58,35 @@ LRESULT CALLBACK NativeWindowImpl::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, 
         case WM_SIZE:
             self->resize_webview();
             return 0;
+        case WM_KIRA_IPC_RESPONSE: {
+            std::vector<std::string> responses;
+            {
+                std::lock_guard<std::mutex> lock(g_response_queue_mutex);
+                std::swap(responses, g_pending_responses);
+            }
+            if (self->transport_ && self->transport_->is_ready()) {
+                for (const auto& resp : responses) {
+                    self->transport_->send_message(resp);
+                }
+            }
+            return 0;
+        }
+        case WM_KIRA_INIT_COMPLETE: {
+            bool success = (wParam == 1);
+            if (self->on_init_) {
+                self->on_init_(success);
+            }
+            return 0;
+        }
         case WM_DESTROY:
-            PostQuitMessage(0);
+            // Do not call PostQuitMessage here unless instructed by App
             return 0;
         }
     }
     return DefWindowProcW(hwnd, uMsg, wParam, lParam);
 }
 
-bool NativeWindowImpl::initialize() {
+bool NativeWindow::initialize() {
     HINSTANCE hInstance = GetModuleHandle(NULL);
 
     WNDCLASSEXW wc = {};
@@ -111,26 +125,30 @@ bool NativeWindowImpl::initialize() {
     );
 
     if (!hwnd_) {
-        std::cerr << "[Kira] Failed to create Win32 window." << std::endl;
+        std::cerr << "[Kira] Failed to create Win32 window handle." << std::endl;
         return false;
     }
 
-    // Initialize WebView2 Environment
+    transport_ = std::make_unique<WebViewTransport>(config_, on_message_);
+
+    // Initialize WebView2 Environment asynchronously
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, nullptr, nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [this](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(result) || !env) {
                     std::cerr << "[Kira] CreateCoreWebView2EnvironmentWithOptions failed." << std::endl;
+                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
                     return result;
                 }
 
                 env->CreateCoreWebView2Controller(
                     hwnd_,
                     Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                        [this, env](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
                             if (FAILED(res) || !controller) {
                                 std::cerr << "[Kira] CreateCoreWebView2Controller failed." << std::endl;
+                                if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
                                 return res;
                             }
 
@@ -138,27 +156,47 @@ bool NativeWindowImpl::initialize() {
                             webview_controller_->get_CoreWebView2(&webview_);
 
                             resize_webview();
-                            inject_kira_ipc_script();
 
-                            // Wire message handler
-                            webview_->add_WebMessageReceived(
-                                Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                    [this](ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                                        PWSTR message_raw = nullptr;
-                                        if (SUCCEEDED(args->TryGetWebMessageAsString(&message_raw)) && message_raw) {
-                                            std::string msg = wstring_to_string(message_raw);
-                                            CoTaskMemFree(message_raw);
+                            // Production asset virtual host mapping if not in dev mode
+                            if (config_.dev_url.empty()) {
+                                auto asset_opt = SecurityPolicy::validate_asset_directory(config_.asset_dir);
+                                if (!asset_opt.has_value()) {
+                                    std::cerr << "[Kira Error] Invalid or missing production asset directory: " << config_.asset_dir << std::endl;
+                                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                    return E_FAIL;
+                                }
 
-                                            if (on_web_message_) {
-                                                on_web_message_(msg);
-                                            }
-                                        }
-                                        return S_OK;
-                                    }).Get(),
-                                &web_message_token_
-                            );
+                                Microsoft::WRL::ComPtr<ICoreWebView2_3> webview3;
+                                HRESULT q_hr = webview_.As(&webview3);
+                                if (FAILED(q_hr) || !webview3) {
+                                    std::cerr << "[Kira Error] QueryInterface for ICoreWebView2_3 failed." << std::endl;
+                                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                    return q_hr;
+                                }
 
-                            navigate_to_target();
+                                HRESULT map_hr = webview3->SetVirtualHostNameToFolderMapping(
+                                    L"kira.local",
+                                    asset_opt->c_str(),
+                                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW
+                                );
+
+                                if (FAILED(map_hr)) {
+                                    std::cerr << "[Kira Error] SetVirtualHostNameToFolderMapping failed, hr=0x" << std::hex << map_hr << std::endl;
+                                    if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                    return map_hr;
+                                }
+                            }
+
+                            if (!transport_->attach(webview_.Get())) {
+                                std::cerr << "[Kira Error] Failed to attach transport to WebView2." << std::endl;
+                                if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                return E_FAIL;
+                            }
+
+                            navigate();
+
+                            // Signal initialization success to Win32 message loop
+                            if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 1, 0);
                             return S_OK;
                         }).Get()
                 );
@@ -167,14 +205,26 @@ bool NativeWindowImpl::initialize() {
     );
 
     if (FAILED(hr)) {
-        std::cerr << "[Kira] WebView2 environment creation request failed, hr=0x" << std::hex << hr << std::endl;
+        std::cerr << "[Kira] CreateCoreWebView2EnvironmentWithOptions request failed." << std::endl;
         return false;
     }
 
     return true;
 }
 
-void NativeWindowImpl::resize_webview() {
+void NativeWindow::navigate() {
+    if (!webview_) return;
+
+    if (!config_.dev_url.empty()) {
+        std::wstring wurl = string_to_wstring(config_.dev_url);
+        webview_->Navigate(wurl.c_str());
+    } else {
+        // Production virtual host mapping: https://kira.local/index.html
+        webview_->Navigate(L"https://kira.local/index.html");
+    }
+}
+
+void NativeWindow::resize_webview() {
     if (webview_controller_ && hwnd_) {
         RECT bounds;
         GetClientRect(hwnd_, &bounds);
@@ -182,96 +232,26 @@ void NativeWindowImpl::resize_webview() {
     }
 }
 
-void NativeWindowImpl::inject_kira_ipc_script() {
-    if (!webview_) return;
-
-    std::wstring ipc_js = L"(function() {\n"
-                          L"    if (window.invoke) return;\n"
-                          L"    const pendingPromises = new Map();\n"
-                          L"    let reqCounter = 0;\n"
-                          L"    window.invoke = function(command, args = {}) {\n"
-                          L"        return new Promise((resolve, reject) => {\n"
-                          L"            const id = 'kira_req_' + (++reqCounter) + '_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);\n"
-                          L"            pendingPromises.set(id, { resolve, reject });\n"
-                          L"            const payload = JSON.stringify({ id, command, args });\n"
-                          L"            window.chrome.webview.postMessage(payload);\n"
-                          L"        });\n"
-                          L"    };\n"
-                          L"    window.chrome.webview.addEventListener('message', function(event) {\n"
-                          L"        try {\n"
-                          L"            const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;\n"
-                          L"            if (data && data.id && pendingPromises.has(data.id)) {\n"
-                          L"                const { resolve, reject } = pendingPromises.get(data.id);\n"
-                          L"                pendingPromises.delete(data.id);\n"
-                          L"                if (data.status === 'ok') {\n"
-                          L"                    resolve(data.result);\n"
-                          L"                } else {\n"
-                          L"                    reject(new Error(data.error || 'IPC Error'));\n"
-                          L"                }\n"
-                          L"            }\n"
-                          L"        } catch (e) {\n"
-                          L"            console.error('[Kira IPC] Error parsing IPC response:', e);\n"
-                          L"        }\n"
-                          L"    });\n"
-                          L"})();";
-
-    webview_->AddScriptToExecuteOnDocumentCreated(ipc_js.c_str(), nullptr);
-}
-
-void NativeWindowImpl::navigate_to_target() {
-    if (!webview_) return;
-
-    if (!config_.dev_url.empty()) {
-        std::wstring wurl = string_to_wstring(config_.dev_url);
-        webview_->Navigate(wurl.c_str());
-        return;
-    }
-
-    std::filesystem::path html_path;
-    if (!config_.asset_path.empty()) {
-        html_path = std::filesystem::absolute(config_.asset_path);
-    } else {
-        // Default to assets/index.html next to executable
-        wchar_t exe_path_buf[MAX_PATH];
-        GetModuleFileNameW(NULL, exe_path_buf, MAX_PATH);
-        std::filesystem::path exe_dir = std::filesystem::path(exe_path_buf).parent_path();
-        html_path = exe_dir / "assets" / "index.html";
-    }
-
-    if (std::filesystem::exists(html_path)) {
-        std::wstring file_url = L"file:///" + html_path.wstring();
-        webview_->Navigate(file_url.c_str());
-    } else {
-        std::string fallback_html = "<html><body style='font-family:sans-serif;padding:2rem;background:#1e1e2e;color:#cdd6f4;'>"
-                                      "<h2>Kira Application Framework</h2>"
-                                      "<p>Asset not found at: " + html_path.string() + "</p>"
-                                      "</body></html>";
-        webview_->NavigateToString(string_to_wstring(fallback_html).c_str());
-    }
-}
-
-void NativeWindowImpl::post_web_message(const std::string& message) {
-    if (webview_) {
-        std::wstring wmsg = string_to_wstring(message);
-        webview_->PostWebMessageAsString(wmsg.c_str());
-    }
-}
-
-void NativeWindowImpl::set_on_web_message(NativeWindow::MessageCallback callback) {
-    on_web_message_ = std::move(callback);
-}
-
-void NativeWindowImpl::show() {
+void NativeWindow::show() {
     if (hwnd_) {
         ShowWindow(hwnd_, SW_SHOW);
         UpdateWindow(hwnd_);
-
-        MSG msg;
-        while (GetMessage(&msg, NULL, 0, 0)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
     }
+}
+
+void NativeWindow::hide() {
+    if (hwnd_) {
+        ShowWindow(hwnd_, SW_HIDE);
+    }
+}
+
+void NativeWindow::post_ui_response(const std::string& response_json) {
+    if (!hwnd_) return;
+    {
+        std::lock_guard<std::mutex> lock(g_response_queue_mutex);
+        g_pending_responses.push_back(response_json);
+    }
+    PostMessage(hwnd_, WM_KIRA_IPC_RESPONSE, 0, 0);
 }
 
 } // namespace kira
