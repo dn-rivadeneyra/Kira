@@ -4,6 +4,7 @@
 #include "src/core/protocol.hpp"
 #include "src/core/executor.hpp"
 #include "src/core/worker.hpp"
+#include "src/core/pipeline.hpp"
 #include "src/platform/windows/win32_window.hpp"
 
 #include <iostream>
@@ -15,7 +16,13 @@ namespace kira {
 class AppImpl {
 public:
     explicit AppImpl(const AppConfig& config)
-        : config_(config), state_(ReadinessState::created) {}
+        : config_(config),
+          state_(ReadinessState::created),
+          pipeline_(registry_, worker_, [this](const std::string& raw_resp) {
+              if (state_ == ReadinessState::ready && window_) {
+                  window_->post_ui_response(raw_resp);
+              }
+          }) {}
 
     ~AppImpl() {
         shutdown();
@@ -34,11 +41,18 @@ public:
         window_ = std::make_unique<NativeWindow>(
             config_.window,
             [this](const std::string& raw_msg) {
-                handle_incoming_raw_message(raw_msg);
+                if (state_ == ReadinessState::ready) {
+                    pipeline_.process_raw_message(raw_msg);
+                }
             },
             [&init_success, &init_finished](bool success) {
                 init_success = success;
                 init_finished = true;
+            },
+            [this]() {
+                // Window close requested callback (e.g. WM_CLOSE)
+                shutdown();
+                PostQuitMessage(0);
             }
         );
 
@@ -57,10 +71,11 @@ public:
             if (state_ == ReadinessState::initializing && init_finished) {
                 if (init_success) {
                     state_ = ReadinessState::ready;
+                    pipeline_.set_ready(true);
                     window_->show();
                 } else {
                     state_ = ReadinessState::failed;
-                    std::cerr << "[Kira Error] WebView2 initialization reported failure." << std::endl;
+                    std::cerr << "[Kira Error] WebView2 initialization or navigation failed." << std::endl;
                     shutdown();
                     return -1;
                 }
@@ -87,6 +102,7 @@ public:
         // 1. Stop accepting new IPC requests
         // 2. Mark app as closing
         state_ = ReadinessState::closing;
+        pipeline_.shutdown();
 
         // 3. Stop worker, 4. Finish current task, 5. Discard unstarted, 6. Join thread
         worker_.stop_and_join();
@@ -102,48 +118,11 @@ public:
     }
 
 private:
-    void handle_incoming_raw_message(const std::string& raw_utf8_msg) {
-        // 1. Check readiness & shutdown state
-        if (state_ != ReadinessState::ready) {
-            return;
-        }
-
-        // 2. Parse protocol message
-        auto parse_result = ProtocolCodec::parse(raw_utf8_msg);
-        if (std::holds_alternative<ProtocolError>(parse_result)) {
-            const auto& proto_err = std::get<ProtocolError>(parse_result);
-            std::string err_json = ProtocolCodec::serialize_protocol_error(proto_err);
-            if (window_) {
-                window_->post_ui_response(err_json);
-            }
-            return;
-        }
-
-        auto req = std::get<InvocationRequest>(parse_result);
-
-        // 3. Enqueue command execution to WorkerExecutor off UI thread
-        worker_.enqueue([this, req]() {
-            if (state_ != ReadinessState::ready) {
-                return;
-            }
-
-            // Execute command off UI thread
-            InvocationResult res = CommandExecutor::execute(req, registry_);
-
-            // Serialize result
-            std::string resp_json = ProtocolCodec::serialize_result(res);
-
-            // Post response back to Win32 UI thread message queue
-            if (state_ == ReadinessState::ready && window_) {
-                window_->post_ui_response(resp_json);
-            }
-        });
-    }
-
     AppConfig config_;
     std::atomic<ReadinessState> state_{ReadinessState::created};
     CommandRegistry registry_;
     WorkerExecutor worker_;
+    InvocationPipeline pipeline_;
     std::unique_ptr<NativeWindow> window_;
 };
 

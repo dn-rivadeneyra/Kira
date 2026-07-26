@@ -1,3 +1,5 @@
+#pragma once
+
 #include "src/core/types.hpp"
 #include "src/core/registry.hpp"
 

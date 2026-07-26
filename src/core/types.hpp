@@ -16,8 +16,7 @@ enum class ErrorCode {
     invalid_payload,
     command_not_found,
     command_exception,
-    internal_error,
-    request_timeout
+    internal_error
 };
 
 struct CommandError {

@@ -5,6 +5,7 @@
 #include <WebView2.h>
 #include <string>
 #include <functional>
+#include <memory>
 #include "kira/app.hpp"
 
 namespace kira {
@@ -25,7 +26,7 @@ public:
     // Posts raw UTF-8 string message back to JS context (must run on Win32 UI thread)
     bool send_message(const std::string& raw_utf8_message);
 
-    bool is_ready() const { return webview_ != nullptr && ready_; }
+    bool is_ready() const { return webview_ != nullptr && ready_ && *alive_token_; }
 
 private:
     void inject_native_bootstrap();
@@ -36,6 +37,9 @@ private:
     Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
     EventRegistrationToken web_message_token_{};
     EventRegistrationToken nav_starting_token_{};
+
+    // Shared lifetime token for safe asynchronous callbacks
+    std::shared_ptr<bool> alive_token_;
     bool ready_{false};
 };
 

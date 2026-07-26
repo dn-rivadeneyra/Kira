@@ -14,7 +14,6 @@ std::string ProtocolCodec::error_code_to_string(ErrorCode code) {
         case ErrorCode::command_not_found: return "command_not_found";
         case ErrorCode::command_exception: return "command_exception";
         case ErrorCode::internal_error: return "internal_error";
-        case ErrorCode::request_timeout: return "request_timeout";
     }
     return "internal_error";
 }
@@ -49,7 +48,7 @@ std::variant<InvocationRequest, ProtocolError> ProtocolCodec::parse(const std::s
         };
     }
 
-    // Extract ID first if possible
+    // Extract ID first if valid
     std::optional<std::string> req_id = extract_raw_id(msg);
 
     // 1. Validate version
@@ -141,23 +140,18 @@ std::string ProtocolCodec::serialize_result(const InvocationResult& result) {
 std::string ProtocolCodec::serialize_protocol_error(const ProtocolError& error) {
     nlohmann::json out;
     out["version"] = 1;
+    out["type"] = "protocol_error";
 
     if (error.id.has_value()) {
-        out["type"] = "result";
         out["id"] = *error.id;
-        out["ok"] = false;
-        out["error"] = {
-            {"code", error_code_to_string(error.code)},
-            {"message", error.message}
-        };
     } else {
-        out["type"] = "protocol_error";
         out["id"] = nullptr;
-        out["error"] = {
-            {"code", error_code_to_string(error.code)},
-            {"message", error.message}
-        };
     }
+
+    out["error"] = {
+        {"code", error_code_to_string(error.code)},
+        {"message", error.message}
+    };
 
     return out.dump();
 }

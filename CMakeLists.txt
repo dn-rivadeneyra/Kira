@@ -18,6 +18,7 @@ add_library(kira STATIC
     src/core/registry.cpp
     src/core/executor.cpp
     src/core/worker.cpp
+    src/core/pipeline.cpp
     src/core/app.cpp
     src/platform/windows/security.cpp
     src/platform/windows/webview_transport.cpp
@@ -40,6 +41,7 @@ target_link_libraries(kira PUBLIC
     ole32
     shlwapi
     dwmapi
+    urlmon
 )
 
 target_compile_features(kira PUBLIC cxx_std_23)
@@ -80,13 +82,26 @@ target_include_directories(kira_test_executor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 target_link_libraries(kira_test_executor PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME test_executor COMMAND kira_test_executor)
 
-# Pipeline Integration Test Target (Platform-Independent using FakeTransport)
+# 4. Windows Security Unit Test Target (Windows only, no WebView2 runtime needed)
+add_executable(kira_test_security
+    tests/unit/test_security.cpp
+    src/platform/windows/security.cpp
+)
+target_include_directories(kira_test_security PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(kira_test_security PRIVATE nlohmann_json::nlohmann_json shlwapi urlmon)
+add_test(NAME test_security COMMAND kira_test_security)
+
+# 5. Pipeline Integration Test Target (Platform-Independent using InvocationPipeline)
 add_executable(kira_pipeline_tests
     tests/integration/test_pipeline.cpp
     src/core/protocol.cpp
     src/core/registry.cpp
     src/core/executor.cpp
     src/core/worker.cpp
+    src/core/pipeline.cpp
 )
 
 target_include_directories(kira_pipeline_tests PRIVATE

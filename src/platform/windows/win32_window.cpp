@@ -1,8 +1,6 @@
 #include "src/platform/windows/win32_window.hpp"
 #include "src/platform/windows/security.hpp"
 #include <iostream>
-#include <vector>
-#include <mutex>
 
 namespace kira {
 
@@ -14,32 +12,62 @@ static std::wstring string_to_wstring(const std::string& str) {
     return wstr;
 }
 
-// Queue for pending IPC responses posted to Win32 UI thread
-static std::mutex g_response_queue_mutex;
-static std::vector<std::string> g_pending_responses;
+static std::string wstring_to_string(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string str(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)str.size(), &str[0], size_needed, NULL, NULL);
+    return str;
+}
 
-NativeWindow::NativeWindow(const WindowConfig& config, RawMessageCallback on_message, InitCallback on_init)
-    : config_(config), on_message_(std::move(on_message)), on_init_(std::move(on_init)) {}
+NativeWindow::NativeWindow(
+    const WindowConfig& config,
+    RawMessageCallback on_message,
+    InitCallback on_init,
+    CloseRequestedCallback on_close_requested
+)
+    : config_(config),
+      on_message_(std::move(on_message)),
+      on_init_(std::move(on_init)),
+      on_close_requested_(std::move(on_close_requested)),
+      alive_token_(std::make_shared<bool>(true)) {}
 
 NativeWindow::~NativeWindow() {
     close();
 }
 
 void NativeWindow::close() {
+    if (alive_token_) {
+        *alive_token_ = false; // Invalidate all pending callbacks
+    }
+
     if (transport_) {
         transport_->detach();
         transport_.reset();
     }
+
+    if (webview_ && nav_completed_token_.value != 0) {
+        webview_->remove_NavigationCompleted(nav_completed_token_);
+        nav_completed_token_.value = 0;
+    }
+
     if (webview_controller_) {
         webview_controller_->Close();
         webview_controller_ = nullptr;
     }
+
     if (webview_) {
         webview_ = nullptr;
     }
+
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        response_queue_.clear();
     }
 }
 
@@ -58,19 +86,17 @@ LRESULT CALLBACK NativeWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
         case WM_SIZE:
             self->resize_webview();
             return 0;
-        case WM_KIRA_IPC_RESPONSE: {
-            std::vector<std::string> responses;
-            {
-                std::lock_guard<std::mutex> lock(g_response_queue_mutex);
-                std::swap(responses, g_pending_responses);
-            }
-            if (self->transport_ && self->transport_->is_ready()) {
-                for (const auto& resp : responses) {
-                    self->transport_->send_message(resp);
-                }
+
+        case WM_CLOSE:
+            if (self->on_close_requested_) {
+                self->on_close_requested_();
             }
             return 0;
-        }
+
+        case WM_KIRA_IPC_RESPONSE:
+            self->drain_response_queue();
+            return 0;
+
         case WM_KIRA_INIT_COMPLETE: {
             bool success = (wParam == 1);
             if (self->on_init_) {
@@ -78,12 +104,26 @@ LRESULT CALLBACK NativeWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
             }
             return 0;
         }
+
         case WM_DESTROY:
-            // Do not call PostQuitMessage here unless instructed by App
             return 0;
         }
     }
     return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+}
+
+void NativeWindow::drain_response_queue() {
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        std::swap(pending, response_queue_);
+    }
+
+    if (transport_ && transport_->is_ready() && alive_token_ && *alive_token_) {
+        for (const auto& resp : pending) {
+            transport_->send_message(resp);
+        }
+    }
 }
 
 bool NativeWindow::initialize() {
@@ -135,7 +175,9 @@ bool NativeWindow::initialize() {
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, nullptr, nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+            [this, token = alive_token_](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                if (!*token) return S_OK;
+
                 if (FAILED(result) || !env) {
                     std::cerr << "[Kira] CreateCoreWebView2EnvironmentWithOptions failed." << std::endl;
                     if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
@@ -145,7 +187,9 @@ bool NativeWindow::initialize() {
                 env->CreateCoreWebView2Controller(
                     hwnd_,
                     Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this, env](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                        [this, token](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                            if (!*token) return S_OK;
+
                             if (FAILED(res) || !controller) {
                                 std::cerr << "[Kira] CreateCoreWebView2Controller failed." << std::endl;
                                 if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
@@ -193,10 +237,39 @@ bool NativeWindow::initialize() {
                                 return E_FAIL;
                             }
 
-                            navigate();
+                            // Attach NavigationCompleted handler to confirm readiness ONLY after top-level document loads successfully
+                            webview_->add_NavigationCompleted(
+                                Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                                    [this, token](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                                        if (!*token || !args) return S_OK;
 
-                            // Signal initialization success to Win32 message loop
-                            if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 1, 0);
+                                        BOOL is_success = FALSE;
+                                        if (FAILED(args->get_IsSuccess(&is_success)) || !is_success) {
+                                            std::cerr << "[Kira Error] WebView2 navigation failed or was cancelled." << std::endl;
+                                            if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                            return S_OK;
+                                        }
+
+                                        PWSTR source_raw = nullptr;
+                                        if (SUCCEEDED(webview_->get_Source(&source_raw)) && source_raw) {
+                                            std::string loaded_uri = wstring_to_string(source_raw);
+                                            CoTaskMemFree(source_raw);
+
+                                            if (!SecurityPolicy::is_approved_origin(loaded_uri, config_)) {
+                                                std::cerr << "[Kira Security] Loaded document is not an approved origin: " << loaded_uri << std::endl;
+                                                if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 0, 0);
+                                                return S_OK;
+                                            }
+                                        }
+
+                                        // Signal initialization success only after top-level document has loaded
+                                        if (hwnd_) PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, 1, 0);
+                                        return S_OK;
+                                    }).Get(),
+                                &nav_completed_token_
+                            );
+
+                            navigate();
                             return S_OK;
                         }).Get()
                 );
@@ -219,7 +292,6 @@ void NativeWindow::navigate() {
         std::wstring wurl = string_to_wstring(config_.dev_url);
         webview_->Navigate(wurl.c_str());
     } else {
-        // Production virtual host mapping: https://kira.local/index.html
         webview_->Navigate(L"https://kira.local/index.html");
     }
 }
@@ -246,10 +318,10 @@ void NativeWindow::hide() {
 }
 
 void NativeWindow::post_ui_response(const std::string& response_json) {
-    if (!hwnd_) return;
+    if (!hwnd_ || !alive_token_ || !*alive_token_) return;
     {
-        std::lock_guard<std::mutex> lock(g_response_queue_mutex);
-        g_pending_responses.push_back(response_json);
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        response_queue_.push_back(response_json);
     }
     PostMessage(hwnd_, WM_KIRA_IPC_RESPONSE, 0, 0);
 }

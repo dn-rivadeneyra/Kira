@@ -4,114 +4,246 @@
 #include <vector>
 #include <mutex>
 #include <future>
-#include "src/core/protocol.hpp"
-#include "src/core/registry.hpp"
-#include "src/core/executor.hpp"
-#include "src/core/worker.hpp"
+#include <condition_variable>
+#include <chrono>
+#include "src/core/pipeline.hpp"
 
 using namespace kira;
 
-// Platform-independent FakeTransport simulating raw UTF-8 string transport boundary
-class FakeTransport {
+class PipelineTestHarness {
 public:
-    void send_response(const std::string& raw_response) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        received_responses_.push_back(raw_response);
-        if (on_response_prom_) {
-            on_response_prom_->set_value(raw_response);
+    PipelineTestHarness()
+        : pipeline_(registry_, worker_, [this](const std::string& msg) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            responses_.push_back(msg);
+            if (promise_) {
+                promise_->set_value(msg);
+            }
+        })
+    {
+        pipeline_.set_ready(true);
+    }
+
+    ~PipelineTestHarness() {
+        pipeline_.shutdown();
+        worker_.stop_and_join();
+    }
+
+    CommandRegistry& registry() { return registry_; }
+    WorkerExecutor& worker() { return worker_; }
+    InvocationPipeline& pipeline() { return pipeline_; }
+
+    std::string process_and_wait(const std::string& raw_msg) {
+        std::promise<std::string> prom;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            promise_ = &prom;
         }
+        pipeline_.process_raw_message(raw_msg);
+        std::future<std::string> fut = prom.get_future();
+        auto status = fut.wait_for(std::chrono::seconds(5));
+        assert(status == std::future_status::ready);
+        std::string res = fut.get();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            promise_ = nullptr;
+        }
+        return res;
     }
 
     std::vector<std::string> get_responses() const {
         std::lock_guard<std::mutex> lock(mtx_);
-        return received_responses_;
-    }
-
-    void set_promise(std::promise<std::string>* prom) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        on_response_prom_ = prom;
+        return responses_;
     }
 
 private:
+    CommandRegistry registry_;
+    WorkerExecutor worker_;
     mutable std::mutex mtx_;
-    std::vector<std::string> received_responses_;
-    std::promise<std::string>* on_response_prom_{nullptr};
+    std::promise<std::string>* promise_{nullptr};
+    std::vector<std::string> responses_;
+    InvocationPipeline pipeline_;
 };
 
-void test_full_pipeline_success() {
-    CommandRegistry registry;
-    registry.register_command("greet", [](const nlohmann::json& payload) {
-        std::string name = payload.value("name", "World");
-        return nlohmann::json{{"greeting", "Hello, " + name + "!"}};
+void test_pipeline_valid_command() {
+    PipelineTestHarness harness;
+    harness.registry().register_command("greet", [](const nlohmann::json& payload) {
+        return nlohmann::json{{"message", "Hello, " + payload.value("name", "World") + "!"}};
     });
 
-    WorkerExecutor worker;
-    FakeTransport transport;
-    std::promise<std::string> response_promise;
-    transport.set_promise(&response_promise);
+    std::string req = R"({ "version": 1, "type": "invoke", "id": "req-1", "command": "greet", "payload": { "name": "Alice" } })";
+    std::string resp_str = harness.process_and_wait(req);
 
-    // 1. Raw wire message received at transport boundary
-    std::string raw_wire_req = R"({
-        "version": 1,
-        "type": "invoke",
-        "id": "pipe-req-1",
-        "command": "greet",
-        "payload": { "name": "Kira Pipeline" }
-    })";
-
-    // 2. Parse protocol message
-    auto parse_res = ProtocolCodec::parse(raw_wire_req);
-    assert(std::holds_alternative<InvocationRequest>(parse_res));
-    auto req = std::get<InvocationRequest>(parse_res);
-
-    // 3. Enqueue to WorkerExecutor off calling thread
-    worker.enqueue([req, &registry, &transport]() {
-        // Execute on worker thread
-        auto result = CommandExecutor::execute(req, registry);
-        // Serialize result
-        std::string raw_resp = ProtocolCodec::serialize_result(result);
-        // Send back to fake transport
-        transport.send_response(raw_resp);
-    });
-
-    // 4. Wait for response at transport boundary
-    std::string response_json = response_promise.get_future().get();
-    worker.stop_and_join();
-
-    // 5. Verify response payload
-    auto resp = nlohmann::json::parse(response_json);
-    assert(resp["version"] == 1);
-    assert(resp["type"] == "result");
-    assert(resp["id"] == "pipe-req-1");
-    assert(resp["ok"] == true);
-    assert(resp["value"]["greeting"] == "Hello, Kira Pipeline!");
-
-    std::cout << "[PASS] test_full_pipeline_success" << std::endl;
+    auto json = nlohmann::json::parse(resp_str);
+    assert(json["version"] == 1);
+    assert(json["type"] == "result");
+    assert(json["id"] == "req-1");
+    assert(json["ok"] == true);
+    assert(json["value"]["message"] == "Hello, Alice!");
+    std::cout << "[PASS] test_pipeline_valid_command" << std::endl;
 }
 
-void test_full_pipeline_protocol_error() {
+void test_pipeline_unknown_command() {
+    PipelineTestHarness harness;
+    std::string req = R"({ "version": 1, "type": "invoke", "id": "req-2", "command": "nonexistent" })";
+    std::string resp_str = harness.process_and_wait(req);
+
+    auto json = nlohmann::json::parse(resp_str);
+    assert(json["version"] == 1);
+    assert(json["type"] == "result"); // Valid invocation reaching executor uses "type": "result"
+    assert(json["id"] == "req-2");
+    assert(json["ok"] == false);
+    assert(json["error"]["code"] == "command_not_found");
+    std::cout << "[PASS] test_pipeline_unknown_command" << std::endl;
+}
+
+void test_pipeline_protocol_errors() {
+    PipelineTestHarness harness;
+
+    // 1. Invalid JSON
+    std::string resp1_str = harness.process_and_wait("{ invalid json ");
+    auto json1 = nlohmann::json::parse(resp1_str);
+    assert(json1["version"] == 1);
+    assert(json1["type"] == "protocol_error");
+    assert(json1["id"].is_null());
+    assert(json1["error"]["code"] == "invalid_json");
+
+    // 2. Invalid Protocol Version with recoverable ID
+    std::string req2 = R"({ "version": 99, "type": "invoke", "id": "recover-id-123", "command": "greet" })";
+    std::string resp2_str = harness.process_and_wait(req2);
+    auto json2 = nlohmann::json::parse(resp2_str);
+    assert(json2["version"] == 1);
+    assert(json2["type"] == "protocol_error");
+    assert(json2["id"] == "recover-id-123");
+    assert(json2["error"]["code"] == "unsupported_protocol_version");
+
+    // 3. Invalid Payload
+    std::string req3 = R"({ "version": 1, "type": "invoke", "id": "req-3", "command": "greet", "payload": [1, 2] })";
+    std::string resp3_str = harness.process_and_wait(req3);
+    auto json3 = nlohmann::json::parse(resp3_str);
+    assert(json3["version"] == 1);
+    assert(json3["type"] == "protocol_error");
+    assert(json3["id"] == "req-3");
+    assert(json3["error"]["code"] == "invalid_payload");
+
+    std::cout << "[PASS] test_pipeline_protocol_errors" << std::endl;
+}
+
+void test_pipeline_fifo_and_off_caller_thread() {
+    PipelineTestHarness harness;
+    std::thread::id caller_id = std::this_thread::get_id();
+    std::thread::id worker_id;
+
+    std::vector<int> execution_order;
+    std::mutex mtx;
+
+    for (int i = 0; i < 5; ++i) {
+        std::string cmd_name = "cmd_" + std::to_string(i);
+        harness.registry().register_command(cmd_name, [i, &caller_id, &worker_id, &execution_order, &mtx](const nlohmann::json&) {
+            worker_id = std::this_thread::get_id();
+            std::lock_guard<std::mutex> lock(mtx);
+            execution_order.push_back(i);
+            return nlohmann::json{{"idx", i}};
+        });
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        std::string req = "{\"version\":1,\"type\":\"invoke\",\"id\":\"id-" + std::to_string(i) + "\",\"command\":\"cmd_" + std::to_string(i) + "\"}";
+        harness.pipeline().process_raw_message(req);
+    }
+
+    // Wait for all 5 responses
+    while (harness.get_responses().size() < 5) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    assert(worker_id != caller_id);
+    assert(execution_order.size() == 5);
+    for (int i = 0; i < 5; ++i) {
+        assert(execution_order[i] == i);
+    }
+
+    std::cout << "[PASS] test_pipeline_fifo_and_off_caller_thread" << std::endl;
+}
+
+void test_pipeline_shutdown_behavior() {
+    CommandRegistry registry;
     WorkerExecutor worker;
-    FakeTransport transport;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool task1_started = false;
+    bool task1_can_finish = false;
+    bool task1_completed = false;
+    bool task2_ran = false;
 
-    std::string raw_invalid_msg = R"({ "version": 99, "type": "invoke", "id": "err-req" })";
-    auto parse_res = ProtocolCodec::parse(raw_invalid_msg);
-    assert(std::holds_alternative<ProtocolError>(parse_res));
+    registry.register_command("block_cmd", [&](const nlohmann::json&) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            task1_started = true;
+        }
+        cv.notify_all();
 
-    auto proto_err = std::get<ProtocolError>(parse_res);
-    std::string serialized_err = ProtocolCodec::serialize_protocol_error(proto_err);
-    transport.send_response(serialized_err);
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() { return task1_can_finish; });
+        task1_completed = true;
+        return nlohmann::json{{"ok", true}};
+    });
 
-    auto resp = nlohmann::json::parse(transport.get_responses()[0]);
-    assert(resp["version"] == 1);
-    assert(resp["ok"] == false);
-    assert(resp["error"]["code"] == "unsupported_protocol_version");
+    registry.register_command("queued_cmd", [&](const nlohmann::json&) {
+        std::lock_guard<std::mutex> lock(mtx);
+        task2_ran = true;
+        return nlohmann::json{{"ok", true}};
+    });
 
-    std::cout << "[PASS] test_full_pipeline_protocol_error" << std::endl;
+    std::vector<std::string> pipeline_responses;
+    InvocationPipeline pipeline(registry, worker, [&](const std::string& msg) {
+        std::lock_guard<std::mutex> lock(mtx);
+        pipeline_responses.push_back(msg);
+    });
+    pipeline.set_ready(true);
+
+    // Send task 1 and task 2
+    pipeline.process_raw_message(R"({ "version": 1, "type": "invoke", "id": "t1", "command": "block_cmd" })");
+    pipeline.process_raw_message(R"({ "version": 1, "type": "invoke", "id": "t2", "command": "queued_cmd" })");
+
+    // Wait until task 1 starts
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() { return task1_started; });
+    }
+
+    // Trigger pipeline and worker shutdown
+    pipeline.shutdown();
+    std::thread shutdown_thread([&]() {
+        worker.stop_and_join();
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Allow task 1 to finish
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        task1_can_finish = true;
+    }
+    cv.notify_all();
+
+    shutdown_thread.join();
+
+    assert(task1_completed);
+    assert(!task2_ran);
+
+    // Verify no callbacks fired after shutdown
+    assert(pipeline_responses.empty());
+
+    std::cout << "[PASS] test_pipeline_shutdown_behavior" << std::endl;
 }
 
 int main() {
-    test_full_pipeline_success();
-    test_full_pipeline_protocol_error();
-    std::cout << "ALL PIPELINE TESTS PASSED." << std::endl;
+    test_pipeline_valid_command();
+    test_pipeline_unknown_command();
+    test_pipeline_protocol_errors();
+    test_pipeline_fifo_and_off_caller_thread();
+    test_pipeline_shutdown_behavior();
+    std::cout << "ALL INVOCATION PIPELINE TESTS PASSED." << std::endl;
     return 0;
 }
