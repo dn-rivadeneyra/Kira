@@ -1,6 +1,7 @@
 #include "kira/app.hpp"
 #include "src/core/types.hpp"
 #include "src/core/gates.hpp"
+#include "src/core/shutdown_coordinator.hpp"
 #include "src/core/registry.hpp"
 #include "src/core/protocol.hpp"
 #include "src/core/executor.hpp"
@@ -57,9 +58,10 @@ public:
                     BOOL posted = PostMessage(window_->get_hwnd(), WM_KIRA_APP_SHUTDOWN, 0, 0);
                     if (!posted) {
                         std::cerr << "[Kira App Error] PostMessage(WM_KIRA_APP_SHUTDOWN) failed, err=" << GetLastError() << std::endl;
-                        // Fallback thread message if window PostMessage fails
                         PostThreadMessage(GetCurrentThreadId(), WM_KIRA_APP_SHUTDOWN, 0, 0);
                     }
+                } else {
+                    PostThreadMessage(GetCurrentThreadId(), WM_KIRA_APP_SHUTDOWN, 0, 0);
                 }
             }
         );
@@ -109,29 +111,25 @@ public:
     }
 
     void shutdown() {
-        // Production ShutdownGate (one-shot state machine)
-        if (!shutdown_gate_.request()) {
-            return; // First shutdown request returns true; subsequent requests return false
-        }
+        // Production AppShutdownCoordinator execution
+        bool executed = coordinator_.execute_shutdown(
+            shutdown_gate_,
+            pipeline_,
+            worker_,
+            [this]() {
+                state_ = ReadinessState::closing;
+                if (window_) {
+                    window_->close();
+                    window_.reset();
+                }
+            },
+            [this]() {
+                PostQuitMessage(0);
+                state_ = ReadinessState::closed;
+            }
+        );
 
-        // 1. Mark app as closing and stop accepting new IPC requests
-        state_ = ReadinessState::closing;
-        pipeline_.shutdown();
-
-        // 2. Stop worker: finish current task, discard queued, join thread
-        worker_.stop_and_join();
-
-        // 3. Destroy window and transport safely outside WndProc callback
-        if (window_) {
-            window_->close();
-            window_.reset();
-        }
-
-        // 4. Post quit message after safe resource cleanup
-        PostQuitMessage(0);
-
-        // 5. Mark app as closed
-        state_ = ReadinessState::closed;
+        (void)executed;
     }
 
     ShutdownGate& shutdown_gate() { return shutdown_gate_; }
@@ -140,6 +138,7 @@ private:
     AppConfig config_;
     std::atomic<ReadinessState> state_{ReadinessState::created};
     ShutdownGate shutdown_gate_;
+    AppShutdownCoordinator coordinator_;
     CommandRegistry registry_;
     WorkerExecutor worker_;
     InvocationPipeline pipeline_;

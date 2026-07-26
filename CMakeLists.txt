@@ -19,6 +19,7 @@ add_library(kira STATIC
     src/core/executor.cpp
     src/core/worker.cpp
     src/core/pipeline.cpp
+    src/core/shutdown_coordinator.cpp
     src/core/app.cpp
     src/platform/windows/security.cpp
     src/platform/windows/webview_transport.cpp
@@ -122,6 +123,7 @@ add_executable(kira_test_lifecycle
     src/core/executor.cpp
     src/core/worker.cpp
     src/core/pipeline.cpp
+    src/core/shutdown_coordinator.cpp
 )
 target_include_directories(kira_test_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(kira_test_lifecycle PRIVATE nlohmann_json::nlohmann_json)

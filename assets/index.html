@@ -8,22 +8,17 @@
 </head>
 <body>
     <div class="container">
-        <header>
-            <div class="logo">⚡ KIRA</div>
-            <p class="subtitle">C++23 Native Desktop Framework</p>
-        </header>
+        <h1>Kira Framework Example</h1>
+        <p>C++23 Native Desktop Application</p>
 
-        <main>
-            <section class="card">
-                <h2>Native Command Test</h2>
-                <div class="input-group">
-                    <input type="text" id="name-input" placeholder="Enter your name" value="World">
-                    <button id="greet-btn">Greet</button>
-                </div>
-                <div id="output" class="output-box">Response will appear here...</div>
-                <a id="iframe-test-link" href="iframe_test.html" style="color:#38bdf8; margin-top:1.5rem; display:inline-block; font-size:0.9rem;">Open Iframe Security Smoke Test →</a>
-            </section>
-        </main>
+        <div class="card">
+            <h3>Greet Command</h3>
+            <input type="text" id="name-input" placeholder="Enter name" value="World">
+            <button id="greet-btn">Greet</button>
+            <div id="output" class="output">Click button to send IPC command</div>
+        </div>
+
+        <p><a href="iframe_test.html" style="color:#38bdf8;">Open Iframe Security Smoke Test →</a></p>
     </div>
 
     <script type="module" src="main.js"></script>

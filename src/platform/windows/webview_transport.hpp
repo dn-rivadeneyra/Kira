@@ -7,24 +7,36 @@
 #include <functional>
 #include <memory>
 #include <atomic>
-#include <mutex>
 #include "kira/app.hpp"
 
 namespace kira {
 
-struct TransportCallbackState {
+using AttachCallback = std::function<void(HRESULT)>;
+
+struct AttachOperationState {
     std::atomic_bool alive{true};
     DWORD ui_thread_id{0};
     Microsoft::WRL::ComPtr<ICoreWebView2> webview;
     WindowConfig config;
     std::function<void(const std::string&)> on_message;
+    EventRegistrationToken nav_starting_token{};
+    EventRegistrationToken web_message_token{};
     std::wstring script_id;
+    AttachCallback callback;
+    std::atomic<bool> attach_completed{false};
+
+    void complete_attach(HRESULT hr) {
+        if (!attach_completed.exchange(true)) {
+            if (callback) {
+                callback(hr);
+            }
+        }
+    }
 };
 
 class WebViewTransport {
 public:
     using MessageCallback = std::function<void(const std::string&)>;
-    using AttachCallback  = std::function<void(HRESULT)>;
 
     WebViewTransport(const WindowConfig& config, MessageCallback on_message);
     ~WebViewTransport();
@@ -36,11 +48,11 @@ public:
     void attach(ICoreWebView2* webview, AttachCallback callback);
     void detach();
 
-    // Posts raw UTF-8 string message back to JS context (must run on Win32 UI thread)
+    // Posts raw UTF-8 string message back to JS context
     bool send_message(const std::string& raw_utf8_message);
 
     bool is_ready() const {
-        return webview_ != nullptr && ready_ && state_ && state_->alive.load();
+        return webview_ != nullptr && ready_ && op_state_ && op_state_->alive.load();
     }
 
     bool is_ui_thread() const {
@@ -48,13 +60,15 @@ public:
     }
 
 private:
+    bool check_ui_thread() const;
+
     WindowConfig config_;
     MessageCallback on_message_;
     Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
     EventRegistrationToken web_message_token_{};
     EventRegistrationToken nav_starting_token_{};
 
-    std::shared_ptr<TransportCallbackState> state_;
+    std::shared_ptr<AttachOperationState> op_state_;
     DWORD ui_thread_id_{0};
     bool ready_{false};
 };

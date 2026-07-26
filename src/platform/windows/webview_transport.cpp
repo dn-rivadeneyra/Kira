@@ -24,22 +24,34 @@ static std::string wstring_to_string(const std::wstring& wstr) {
 WebViewTransport::WebViewTransport(const WindowConfig& config, MessageCallback on_message)
     : config_(config),
       on_message_(std::move(on_message)),
-      state_(std::make_shared<TransportCallbackState>()),
+      op_state_(std::make_shared<AttachOperationState>()),
       ui_thread_id_(GetCurrentThreadId()) {
-    state_->config = config_;
-    state_->on_message = on_message_;
-    state_->ui_thread_id = ui_thread_id_;
+    op_state_->config = config_;
+    op_state_->on_message = on_message_;
+    op_state_->ui_thread_id = ui_thread_id_;
 }
 
 WebViewTransport::~WebViewTransport() {
     detach();
 }
 
-void WebViewTransport::detach() {
-    ready_ = false;
-    if (state_) {
-        state_->alive.store(false);
+bool WebViewTransport::check_ui_thread() const {
+    if (GetCurrentThreadId() != ui_thread_id_) {
+        std::cerr << "[Kira Critical Error] WebViewTransport operation attempted off UI thread!" << std::endl;
+        assert(false && "WebViewTransport operation attempted off UI thread");
+        return false;
     }
+    return true;
+}
+
+void WebViewTransport::detach() {
+    if (!check_ui_thread()) return;
+
+    ready_ = false;
+    if (op_state_) {
+        op_state_->alive.store(false);
+    }
+
     if (webview_) {
         if (web_message_token_.value != 0) {
             HRESULT hr = webview_->remove_WebMessageReceived(web_message_token_);
@@ -55,17 +67,27 @@ void WebViewTransport::detach() {
             }
             nav_starting_token_.value = 0;
         }
+        if (op_state_ && !op_state_->script_id.empty()) {
+            HRESULT hr = webview_->RemoveScriptToExecuteOnDocumentCreated(op_state_->script_id.c_str());
+            if (FAILED(hr)) {
+                std::cerr << "[Kira Transport Error] RemoveScriptToExecuteOnDocumentCreated failed, hr=0x" << std::hex << hr << std::endl;
+            }
+            op_state_->script_id.clear();
+        }
         webview_ = nullptr;
     }
-    if (state_) {
-        state_->webview = nullptr;
-        state_->script_id.clear();
-        state_.reset();
+
+    if (op_state_) {
+        op_state_->webview = nullptr;
+        op_state_.reset();
     }
 }
 
 void WebViewTransport::attach(ICoreWebView2* webview, AttachCallback callback) {
-    assert(is_ui_thread() && "WebViewTransport::attach must be called on the UI thread");
+    if (!check_ui_thread()) {
+        if (callback) callback(E_FAIL);
+        return;
+    }
 
     if (!webview || !callback) {
         if (callback) callback(E_POINTER);
@@ -73,13 +95,15 @@ void WebViewTransport::attach(ICoreWebView2* webview, AttachCallback callback) {
     }
 
     webview_ = webview;
-    if (!state_) {
-        state_ = std::make_shared<TransportCallbackState>();
-        state_->config = config_;
-        state_->on_message = on_message_;
-        state_->ui_thread_id = ui_thread_id_;
+    if (!op_state_) {
+        op_state_ = std::make_shared<AttachOperationState>();
+        op_state_->config = config_;
+        op_state_->on_message = on_message_;
+        op_state_->ui_thread_id = ui_thread_id_;
     }
-    state_->webview = webview_;
+    op_state_->webview = webview_;
+    op_state_->callback = callback;
+    op_state_->attach_completed.store(false);
 
     // Native bootstrap script under window.__KIRA_INTERNAL__
     std::wstring bootstrap_js = L"(function() {\n"
@@ -103,71 +127,76 @@ void WebViewTransport::attach(ICoreWebView2* webview, AttachCallback callback) {
                                 L"    });\n"
                                 L"})();";
 
-    // Step 1: Asynchronously install native bootstrap script and wait for completion handler
+    // Step 1: Asynchronously install native bootstrap script (NO 'this' captured in COM callback lambda!)
     HRESULT hr_boot = webview_->AddScriptToExecuteOnDocumentCreated(
         bootstrap_js.c_str(),
         Microsoft::WRL::Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [this, callback, weak_state = std::weak_ptr<TransportCallbackState>(state_)](HRESULT errorCode, LPCWSTR id) -> HRESULT {
-                auto state = weak_state.lock();
-                if (!state || !state->alive.load()) {
+            [weak_op = std::weak_ptr<AttachOperationState>(op_state_)](HRESULT errorCode, LPCWSTR id) -> HRESULT {
+                auto op = weak_op.lock();
+                if (!op || !op->alive.load()) {
                     return S_OK; // Harmless no-op if transport detached
                 }
 
                 if (FAILED(errorCode) || !id || wcslen(id) == 0) {
                     std::cerr << "[Kira Transport Error] AddScriptToExecuteOnDocumentCreated failed asynchronously, hr=0x" << std::hex << errorCode << std::endl;
-                    detach();
-                    callback(FAILED(errorCode) ? errorCode : E_FAIL);
+                    if (op->webview && !op->script_id.empty()) {
+                        op->webview->RemoveScriptToExecuteOnDocumentCreated(op->script_id.c_str());
+                        op->script_id.clear();
+                    }
+                    op->complete_attach(FAILED(errorCode) ? errorCode : E_FAIL);
                     return S_OK;
                 }
 
-                state->script_id = id;
+                op->script_id = id;
 
-                // Step 2: Register NavigationStarting security handler
-                HRESULT hr_nav = webview_->add_NavigationStarting(
+                // Step 2: Register NavigationStarting security handler (NO 'this' captured in COM callback lambda!)
+                HRESULT hr_nav = op->webview->add_NavigationStarting(
                     Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-                        [weak_state](ICoreWebView2* /*sender*/, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
-                            auto st = weak_state.lock();
+                        [weak_op](ICoreWebView2* /*sender*/, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                            auto st = weak_op.lock();
                             if (!st || !st->alive.load()) return S_OK;
 
-                            // Fail closed: cancel navigation if args is null or URI invalid
-                            if (!args) {
-                                return S_OK;
-                            }
-
-                            PWSTR uri_raw = nullptr;
-                            HRESULT hr_uri = args->get_Uri(&uri_raw);
+                            // Fail closed: cancel navigation whenever args is null or target URI cannot be positively authorized
                             bool authorized = false;
-
-                            if (SUCCEEDED(hr_uri) && uri_raw && wcslen(uri_raw) > 0) {
-                                std::string target_uri = wstring_to_string(uri_raw);
-                                CoTaskMemFree(uri_raw);
-                                authorized = SecurityPolicy::is_approved_origin(target_uri, st->config);
+                            if (args) {
+                                PWSTR uri_raw = nullptr;
+                                HRESULT hr_uri = args->get_Uri(&uri_raw);
+                                if (SUCCEEDED(hr_uri) && uri_raw && wcslen(uri_raw) > 0) {
+                                    std::string target_uri = wstring_to_string(uri_raw);
+                                    CoTaskMemFree(uri_raw);
+                                    authorized = SecurityPolicy::is_approved_origin(target_uri, st->config);
+                                }
                             }
 
                             if (!authorized) {
                                 std::cerr << "[Kira Security] Navigation security failed closed; canceling navigation." << std::endl;
-                                HRESULT hr_cancel = args->put_Cancel(TRUE);
-                                if (FAILED(hr_cancel)) {
-                                    std::cerr << "[Kira Security CRITICAL] put_Cancel(TRUE) failed, hr=0x" << std::hex << hr_cancel << std::endl;
+                                if (args) {
+                                    HRESULT hr_cancel = args->put_Cancel(TRUE);
+                                    if (FAILED(hr_cancel)) {
+                                        std::cerr << "[Kira Security CRITICAL] put_Cancel(TRUE) failed, hr=0x" << std::hex << hr_cancel << std::endl;
+                                    }
                                 }
                             }
                             return S_OK;
                         }).Get(),
-                    &nav_starting_token_
+                    &op->nav_starting_token
                 );
 
                 if (FAILED(hr_nav)) {
                     std::cerr << "[Kira Transport Error] add_NavigationStarting failed, hr=0x" << std::hex << hr_nav << std::endl;
-                    detach();
-                    callback(hr_nav);
+                    if (op->webview && !op->script_id.empty()) {
+                        op->webview->RemoveScriptToExecuteOnDocumentCreated(op->script_id.c_str());
+                        op->script_id.clear();
+                    }
+                    op->complete_attach(hr_nav);
                     return S_OK;
                 }
 
-                // Step 3: Register top-level WebMessageReceived event handler
-                HRESULT hr_msg = webview_->add_WebMessageReceived(
+                // Step 3: Register top-level WebMessageReceived event handler (NO 'this' captured in COM callback lambda!)
+                HRESULT hr_msg = op->webview->add_WebMessageReceived(
                     Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                        [weak_state](ICoreWebView2* /*sender*/, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                            auto st = weak_state.lock();
+                        [weak_op](ICoreWebView2* /*sender*/, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                            auto st = weak_op.lock();
                             if (!st || !st->alive.load() || !args || !st->webview) return S_OK;
 
                             // 1. Verify active top-level document source
@@ -230,18 +259,24 @@ void WebViewTransport::attach(ICoreWebView2* webview, AttachCallback callback) {
                             }
                             return S_OK;
                         }).Get(),
-                    &web_message_token_
+                    &op->web_message_token
                 );
 
                 if (FAILED(hr_msg)) {
                     std::cerr << "[Kira Transport Error] add_WebMessageReceived failed, hr=0x" << std::hex << hr_msg << std::endl;
-                    detach();
-                    callback(hr_msg);
+                    if (op->webview && op->nav_starting_token.value != 0) {
+                        op->webview->remove_NavigationStarting(op->nav_starting_token);
+                        op->nav_starting_token.value = 0;
+                    }
+                    if (op->webview && !op->script_id.empty()) {
+                        op->webview->RemoveScriptToExecuteOnDocumentCreated(op->script_id.c_str());
+                        op->script_id.clear();
+                    }
+                    op->complete_attach(hr_msg);
                     return S_OK;
                 }
 
-                ready_ = true;
-                callback(S_OK);
+                op->complete_attach(S_OK);
                 return S_OK;
             }).Get()
     );
@@ -249,14 +284,14 @@ void WebViewTransport::attach(ICoreWebView2* webview, AttachCallback callback) {
     if (FAILED(hr_boot)) {
         std::cerr << "[Kira Transport Error] AddScriptToExecuteOnDocumentCreated call failed synchronously, hr=0x" << std::hex << hr_boot << std::endl;
         detach();
-        callback(hr_boot);
+        op_state_->complete_attach(hr_boot);
     }
 }
 
 bool WebViewTransport::send_message(const std::string& raw_utf8_message) {
-    assert(is_ui_thread() && "WebViewTransport::send_message must be called on the UI thread");
+    if (!check_ui_thread()) return false;
 
-    if (!ready_ || !state_ || !state_->alive.load() || !webview_) {
+    if (!ready_ || !op_state_ || !op_state_->alive.load() || !webview_) {
         return false;
     }
     std::wstring wmsg = string_to_wstring(raw_utf8_message);

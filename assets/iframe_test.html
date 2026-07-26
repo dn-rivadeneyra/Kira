@@ -9,8 +9,10 @@
         iframe { width: 100%; height: 120px; border: 1px solid #475569; border-radius: 6px; background: #0f172a; margin-top: 1rem; }
         button { background: #3b82f6; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600; }
         button:hover { background: #2563eb; }
-        .pass-tag { color: #4ade80; font-weight: bold; }
-        .fail-tag { color: #f87171; font-weight: bold; }
+        .status-untested { color: #94a3b8; font-weight: bold; }
+        .status-waiting { color: #facc15; font-weight: bold; }
+        .status-pass { color: #4ade80; font-weight: bold; }
+        .status-fail { color: #f87171; font-weight: bold; }
         a { color: #38bdf8; text-decoration: none; display: inline-block; margin-bottom: 1rem; }
         a:hover { text-decoration: underline; }
     </style>
@@ -29,14 +31,17 @@
     <div class="box">
         <h3>2. Same-Origin Iframe Test</h3>
         <p>Invocations attempted from inside an iframe should NOT reach the native host.</p>
-        <div id="status-display" class="pass-tag">Status: PASS (No frame-1 response received)</div>
+        <div id="status-display" class="status-untested">Status: Not Tested</div>
         <iframe id="test-iframe" srcdoc="
             <!DOCTYPE html>
             <html>
             <body style='color:#94a3b8; font-family:sans-serif; padding:10px; margin:0;'>
                 <p style='margin:0 0 10px 0;'>Child Iframe Document</p>
                 <button style='background:#ef4444; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer;'
-                        onclick='window.chrome.webview.postMessage(JSON.stringify({version:1,type:&quot;invoke&quot;,id:&quot;frame-1&quot;,command:&quot;greet&quot;,payload:{name:&quot;Iframe&quot;}}))'>
+                        onclick='
+                            window.parent.postMessage({ type: &quot;iframe_test_started&quot; }, &quot;*&quot;);
+                            window.chrome.webview.postMessage(JSON.stringify({version:1,type:&quot;invoke&quot;,id:&quot;frame-1&quot;,command:&quot;greet&quot;,payload:{name:&quot;Iframe&quot;}}));
+                        '>
                     Try invoke greet from Iframe
                 </button>
             </body>
@@ -49,6 +54,8 @@
 
         const topRes = document.getElementById('top-res');
         const statusDisplay = document.getElementById('status-display');
+        let observeTimer = null;
+        let frameResponded = false;
 
         document.getElementById('top-btn').addEventListener('click', async () => {
             try {
@@ -59,14 +66,33 @@
             }
         });
 
-        // Page-level observation for frame-1 response
+        // Listen for postMessage from child iframe initiating test
+        window.addEventListener('message', (event) => {
+            if (event.data && event.data.type === 'iframe_test_started') {
+                frameResponded = false;
+                statusDisplay.className = 'status-waiting';
+                statusDisplay.innerText = 'Status: WAITING (Observing for 2.0s...)';
+
+                if (observeTimer) clearTimeout(observeTimer);
+                observeTimer = setTimeout(() => {
+                    if (!frameResponded) {
+                        statusDisplay.className = 'status-pass';
+                        statusDisplay.innerText = 'Status: PASS (No frame-1 response received)';
+                    }
+                }, 2000);
+            }
+        });
+
+        // Listen for native IPC response
         if (window.__KIRA_INTERNAL__) {
             window.__KIRA_INTERNAL__.onMessage((rawMsg) => {
                 try {
                     const parsed = JSON.parse(rawMsg);
                     if (parsed.id === 'frame-1') {
-                        statusDisplay.className = 'fail-tag';
-                        statusDisplay.innerText = 'Status: FAIL (Native command executed for frame-1 request!)';
+                        frameResponded = true;
+                        if (observeTimer) clearTimeout(observeTimer);
+                        statusDisplay.className = 'status-fail';
+                        statusDisplay.innerText = 'Status: FAIL (Native host executed frame-1 command!)';
                     }
                 } catch (e) {
                     console.error('[Iframe Smoke Test Error]', e);

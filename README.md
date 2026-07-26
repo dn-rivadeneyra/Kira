@@ -8,7 +8,7 @@
 
 Kira enforces clean separation of concerns, process event loop ownership, and thread safety across its components:
 
-- **`App`**: Process event loop owner, readiness manager, production `ShutdownGate` coordinator, and process lifecycle manager.
+- **`App`**: Process event loop owner, readiness manager, production `ShutdownGate` coordinator, `AppShutdownCoordinator`, and process lifecycle controller.
 - **`CommandRegistry`**: Command handler store validating names against `[A-Za-z][A-Za-z0-9_.-]{0,127}` manually without regex.
 - **`ProtocolCodec`**: Version 1 protocol parser and serializer emitting discriminated results (`type: "invoke"`, `type: "result"`, `type: "protocol_error"`).
 - **`CommandExecutor`**: Command dispatcher masking native exceptions to `command_exception` error codes.
@@ -23,10 +23,13 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
 ## Security & Frame Policy Model
 
 - **Asynchronous Bootstrap Registration**: Native bootstrap installation is asynchronously confirmed through its `AddScriptToExecuteOnDocumentCreated` completion callback before navigation starts.
-- **Fail-Closed Navigation Security**: Top-level origin navigation authorization fails closed (`args->put_Cancel(TRUE)`) if URI normalization fails or target origin is unapproved.
+- **Transactional Script Cleanup**: On attachment failure or `detach()`, registered bootstrap scripts are explicitly removed via `RemoveScriptToExecuteOnDocumentCreated`.
+- **Zero Raw-Owner Captures**: Asynchronous COM callbacks operate via `AttachOperationState` and `WindowAsyncState` weak pointer structs. No raw `this` pointer is captured or dereferenced.
+- **Fail-Closed Navigation Security**: Top-level origin navigation authorization fails closed (`args->put_Cancel(TRUE)`) if URI normalization fails, args is null, or target origin is unapproved.
 - **Top-Level Event Subscription**: Kira subscribes to `ICoreWebView2::WebMessageReceived` on the top-level `CoreWebView2`. Frame `WebMessageReceived` events are not subscribed.
-- **Source Origin Authorization**: The sender URL of every received top-level message is validated against the active top-level document URL (`webview_->get_Source`) and the approved origin policy. Messages from unapproved origins or mismatched contexts are rejected before protocol processing.
-- **Development Mode**: Navigations and IPC messages are validated against the exact configured `dev_url` origin using `CreateUri` / `IUri` (scheme, host, and port matching). Unapproved top-level navigations are canceled during `NavigationStarting`.
+- **Source Origin Authorization**: The sender URL of every received top-level message is validated against the active top-level document URL (`webview_->get_Source`) and approved origin policy.
+- **Release-Mode Thread Enforcement**: WebView operations explicitly verify UI-thread affinity (`check_ui_thread()`) in both debug and release builds.
+- **Development Mode**: Navigations and IPC messages are validated against the exact configured `dev_url` origin using `CreateUri` / `IUri`.
 - **Production Mode**: Production assets are served under the virtual host domain `https://kira.local/` using `SetVirtualHostNameToFolderMapping` (`ICoreWebView2_3`). Direct `file:///` navigation is blocked.
 - **Native Bridge Isolation**: The low-level transport bridge is isolated under `window.__KIRA_INTERNAL__`. The public frontend API is exposed via the browser ES module `packages/api/kira.js`.
 
@@ -70,7 +73,7 @@ Kira enforces clean separation of concerns, process event loop ownership, and th
    2. Click the **"Open Iframe Security Smoke Test →"** link on the main page to navigate to `iframe_test.html`.
    3. Click **"Invoke greet from Top-Level"** and confirm the top-level response appears.
    4. Click **"Try invoke greet from Iframe"** inside the child iframe.
-   5. Confirm status remains `Status: PASS (No frame-1 response received)` and no native command response is returned to the client.
+   5. Confirm status transitions to `Status: WAITING (Observing for 2.0s...)` and then concludes as `Status: PASS (No frame-1 response received)`.
 
 ---
 

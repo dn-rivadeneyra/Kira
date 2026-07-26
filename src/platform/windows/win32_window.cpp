@@ -31,24 +31,35 @@ NativeWindow::NativeWindow(
       on_message_(std::move(on_message)),
       on_init_(std::move(on_init)),
       on_close_requested_(std::move(on_close_requested)),
-      state_(std::make_shared<WindowCallbackState>()),
+      win_state_(std::make_shared<WindowAsyncState>()),
       ui_thread_id_(GetCurrentThreadId()) {
-    state_->on_init = on_init_;
-    state_->on_close_requested = on_close_requested_;
-    state_->ui_thread_id = ui_thread_id_;
+    win_state_->config = config_;
+    win_state_->on_init = on_init_;
+    win_state_->on_close_requested = on_close_requested_;
+    win_state_->ui_thread_id = ui_thread_id_;
 }
 
 NativeWindow::~NativeWindow() {
     close();
 }
 
-void NativeWindow::close() {
-    if (closed_.exchange(true)) {
-        return; // Idempotent return
+bool NativeWindow::check_ui_thread() const {
+    if (GetCurrentThreadId() != ui_thread_id_) {
+        std::cerr << "[Kira Critical Error] NativeWindow operation attempted off UI thread!" << std::endl;
+        assert(false && "NativeWindow operation attempted off UI thread");
+        return false;
     }
+    return true;
+}
 
-    if (state_) {
-        state_->alive.store(false);
+void NativeWindow::close() {
+    if (!check_ui_thread()) return;
+
+    if (win_state_) {
+        if (win_state_->closed.exchange(true)) {
+            return; // Idempotent return
+        }
+        win_state_->alive.store(false);
     }
 
     if (transport_) {
@@ -56,12 +67,12 @@ void NativeWindow::close() {
         transport_.reset();
     }
 
-    if (webview_ && nav_completed_token_.value != 0) {
-        HRESULT hr = webview_->remove_NavigationCompleted(nav_completed_token_);
+    if (webview_ && win_state_ && win_state_->nav_completed_token.value != 0) {
+        HRESULT hr = webview_->remove_NavigationCompleted(win_state_->nav_completed_token);
         if (FAILED(hr)) {
             std::cerr << "[Kira Window Error] remove_NavigationCompleted failed, hr=0x" << std::hex << hr << std::endl;
         }
-        nav_completed_token_.value = 0;
+        win_state_->nav_completed_token.value = 0;
     }
 
     if (webview_controller_) {
@@ -81,40 +92,16 @@ void NativeWindow::close() {
         hwnd_ = nullptr;
     }
 
-    if (state_) {
-        state_->hwnd = nullptr;
-        state_.reset();
+    if (win_state_) {
+        win_state_->hwnd = nullptr;
+        win_state_->webview_controller = nullptr;
+        win_state_->webview = nullptr;
+        win_state_.reset();
     }
 
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         response_queue_.clear();
-    }
-}
-
-void NativeWindow::complete_initialization(bool success) {
-    // Production InitializationGate (one-shot state machine)
-    if (!init_gate_.complete(success)) {
-        return; // First completion call wins; subsequent calls ignored
-    }
-
-    // Unsubscribe initialization NavigationCompleted event handler
-    if (webview_ && nav_completed_token_.value != 0) {
-        webview_->remove_NavigationCompleted(nav_completed_token_);
-        nav_completed_token_.value = 0;
-    }
-
-    if (hwnd_) {
-        BOOL posted = PostMessage(hwnd_, WM_KIRA_INIT_COMPLETE, success ? 1 : 0, 0);
-        if (!posted) {
-            std::cerr << "[Kira Window Error] PostMessage(WM_KIRA_INIT_COMPLETE) failed, err=" << GetLastError() << std::endl;
-            // Fallback synchronous notification if PostMessage fails
-            if (on_init_) {
-                on_init_(success);
-            }
-        }
-    } else if (on_init_) {
-        on_init_(success);
     }
 }
 
@@ -160,7 +147,7 @@ LRESULT CALLBACK NativeWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 }
 
 void NativeWindow::drain_response_queue() {
-    assert(is_ui_thread() && "drain_response_queue must run on UI thread");
+    if (!check_ui_thread()) return;
 
     std::vector<std::string> pending;
     {
@@ -168,7 +155,7 @@ void NativeWindow::drain_response_queue() {
         std::swap(pending, response_queue_);
     }
 
-    if (transport_ && transport_->is_ready() && state_ && state_->alive.load()) {
+    if (transport_ && transport_->is_ready() && win_state_ && win_state_->alive.load()) {
         for (const auto& resp : pending) {
             transport_->send_message(resp);
         }
@@ -176,7 +163,10 @@ void NativeWindow::drain_response_queue() {
 }
 
 bool NativeWindow::initialize() {
-    assert(is_ui_thread() && "NativeWindow::initialize must run on UI thread");
+    if (!check_ui_thread()) {
+        if (win_state_) win_state_->complete_initialization(false);
+        return false;
+    }
 
     HINSTANCE hInstance = GetModuleHandle(NULL);
 
@@ -217,64 +207,71 @@ bool NativeWindow::initialize() {
 
     if (!hwnd_) {
         std::cerr << "[Kira Error] Failed to create Win32 window handle." << std::endl;
-        complete_initialization(false);
+        if (win_state_) win_state_->complete_initialization(false);
         return false;
     }
 
-    state_->hwnd = hwnd_;
+    win_state_->hwnd = hwnd_;
     transport_ = std::make_unique<WebViewTransport>(config_, on_message_);
 
-    // Initialize WebView2 Environment asynchronously
+    // Initialize WebView2 Environment asynchronously (NO 'this' captured in COM callback lambda!)
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, nullptr, nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this, weak_state = std::weak_ptr<WindowCallbackState>(state_)](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                auto st = weak_state.lock();
-                if (!st || !st->alive.load()) return S_OK;
+            [weak_win = std::weak_ptr<WindowAsyncState>(win_state_), transport_ptr = transport_.get()](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                auto win = weak_win.lock();
+                if (!win || !win->alive.load()) return S_OK;
 
                 if (FAILED(result) || !env) {
                     std::cerr << "[Kira Error] CreateCoreWebView2EnvironmentWithOptions failed, hr=0x" << std::hex << result << std::endl;
-                    complete_initialization(false);
+                    win->complete_initialization(false);
                     return result;
                 }
 
+                // Create Controller (NO 'this' captured in COM callback lambda!)
                 HRESULT hr_ctrl = env->CreateCoreWebView2Controller(
-                    hwnd_,
+                    win->hwnd,
                     Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this, weak_state](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
-                            auto st2 = weak_state.lock();
-                            if (!st2 || !st2->alive.load()) return S_OK;
+                        [weak_win, transport_ptr](HRESULT res, ICoreWebView2Controller* controller) -> HRESULT {
+                            auto win2 = weak_win.lock();
+                            if (!win2 || !win2->alive.load()) return S_OK;
 
                             if (FAILED(res) || !controller) {
                                 std::cerr << "[Kira Error] CreateCoreWebView2Controller failed, hr=0x" << std::hex << res << std::endl;
-                                complete_initialization(false);
+                                win2->complete_initialization(false);
                                 return res;
                             }
 
-                            webview_controller_ = controller;
-                            HRESULT hr_get = webview_controller_->get_CoreWebView2(&webview_);
-                            if (FAILED(hr_get) || !webview_) {
+                            win2->webview_controller = controller;
+                            HRESULT hr_get = win2->webview_controller->get_CoreWebView2(&win2->webview);
+                            if (FAILED(hr_get) || !win2->webview) {
                                 std::cerr << "[Kira Error] get_CoreWebView2 failed, hr=0x" << std::hex << hr_get << std::endl;
-                                complete_initialization(false);
+                                win2->complete_initialization(false);
                                 return hr_get;
                             }
 
-                            resize_webview();
+                            // Resize WebView
+                            if (win2->webview_controller && win2->hwnd) {
+                                RECT bounds;
+                                if (GetClientRect(win2->hwnd, &bounds)) {
+                                    win2->webview_controller->put_Bounds(bounds);
+                                }
+                            }
 
                             // Production asset virtual host mapping if not in dev mode
-                            if (config_.dev_url.empty()) {
-                                auto asset_opt = SecurityPolicy::validate_asset_directory(config_.asset_dir);
+                            if (win2->config.dev_url.empty()) {
+                                auto asset_opt = SecurityPolicy::validate_asset_directory(win2->config.asset_dir);
                                 if (!asset_opt.has_value()) {
-                                    std::cerr << "[Kira Error] Invalid or missing production asset directory: " << config_.asset_dir << std::endl;
-                                    complete_initialization(false);
+                                    std::cerr << "[Kira Error] Invalid or missing production asset directory: " << win2->config.asset_dir << std::endl;
+                                    win2->complete_initialization(false);
                                     return E_FAIL;
                                 }
 
                                 Microsoft::WRL::ComPtr<ICoreWebView2_3> webview3;
-                                HRESULT q_hr = webview_.As(&webview3);
+                                HRESULT q_hr = win2->webview.As(&webview3);
                                 if (FAILED(q_hr) || !webview3) {
                                     std::cerr << "[Kira Error] QueryInterface for ICoreWebView2_3 failed, hr=0x" << std::hex << q_hr << std::endl;
-                                    complete_initialization(false);
+                                    win2->complete_initialization(false);
                                     return q_hr;
                                 }
 
@@ -286,67 +283,74 @@ bool NativeWindow::initialize() {
 
                                 if (FAILED(map_hr)) {
                                     std::cerr << "[Kira Error] SetVirtualHostNameToFolderMapping failed, hr=0x" << std::hex << map_hr << std::endl;
-                                    complete_initialization(false);
+                                    win2->complete_initialization(false);
                                     return map_hr;
                                 }
                             }
 
                             // Asynchronous attach: transport attachment continues only after bootstrap registration completes
-                            transport_->attach(webview_.Get(), [this, weak_state](HRESULT attach_hr) {
-                                auto st3 = weak_state.lock();
-                                if (!st3 || !st3->alive.load()) return;
+                            transport_ptr->attach(win2->webview.Get(), [weak_win](HRESULT attach_hr) {
+                                auto win3 = weak_win.lock();
+                                if (!win3 || !win3->alive.load()) return;
 
                                 if (FAILED(attach_hr)) {
                                     std::cerr << "[Kira Error] Asynchronous transport attach failed, hr=0x" << std::hex << attach_hr << std::endl;
-                                    complete_initialization(false);
+                                    win3->complete_initialization(false);
                                     return;
                                 }
 
-                                // Register initial NavigationCompleted handler
-                                HRESULT hr_nav = webview_->add_NavigationCompleted(
+                                // Register initial NavigationCompleted handler (NO 'this' captured in COM callback lambda!)
+                                HRESULT hr_nav = win3->webview->add_NavigationCompleted(
                                     Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                        [this, weak_state](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
-                                            auto st4 = weak_state.lock();
-                                            if (!st4 || !st4->alive.load() || !args) return S_OK;
+                                        [weak_win](ICoreWebView2* /*sender*/, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                                            auto win4 = weak_win.lock();
+                                            if (!win4 || !win4->alive.load() || !args) return S_OK;
 
                                             BOOL is_success = FALSE;
                                             if (FAILED(args->get_IsSuccess(&is_success)) || !is_success) {
                                                 std::cerr << "[Kira Error] WebView2 initial navigation failed or was cancelled." << std::endl;
-                                                complete_initialization(false);
+                                                win4->complete_initialization(false);
                                                 return S_OK;
                                             }
 
                                             PWSTR source_raw = nullptr;
                                             std::string loaded_uri;
-                                            if (SUCCEEDED(webview_->get_Source(&source_raw)) && source_raw) {
+                                            if (SUCCEEDED(win4->webview->get_Source(&source_raw)) && source_raw) {
                                                 loaded_uri = wstring_to_string(source_raw);
                                                 CoTaskMemFree(source_raw);
                                             }
 
-                                            if (loaded_uri.empty() || !SecurityPolicy::is_approved_origin(loaded_uri, config_)) {
+                                            if (loaded_uri.empty() || !SecurityPolicy::is_approved_origin(loaded_uri, win4->config)) {
                                                 std::cerr << "[Kira Security] Loaded document source is invalid or unapproved: " << loaded_uri << std::endl;
-                                                complete_initialization(false);
+                                                win4->complete_initialization(false);
                                                 return S_OK;
                                             }
 
                                             // Signal initialization success only after approved initial document has loaded
-                                            complete_initialization(true);
+                                            win4->complete_initialization(true);
                                             return S_OK;
                                         }).Get(),
-                                    &nav_completed_token_
+                                    &win3->nav_completed_token
                                 );
 
                                 if (FAILED(hr_nav)) {
                                     std::cerr << "[Kira Error] add_NavigationCompleted failed, hr=0x" << std::hex << hr_nav << std::endl;
-                                    complete_initialization(false);
+                                    win3->complete_initialization(false);
                                     return;
                                 }
 
                                 // Navigate only after bootstrap & transport setup complete asynchronously
-                                HRESULT hr_start_nav = navigate();
+                                HRESULT hr_start_nav = S_OK;
+                                if (!win3->config.dev_url.empty()) {
+                                    std::wstring wurl = string_to_wstring(win3->config.dev_url);
+                                    hr_start_nav = win3->webview->Navigate(wurl.c_str());
+                                } else {
+                                    hr_start_nav = win3->webview->Navigate(L"https://kira.local/index.html");
+                                }
+
                                 if (FAILED(hr_start_nav)) {
                                     std::cerr << "[Kira Error] Navigate failed synchronously, hr=0x" << std::hex << hr_start_nav << std::endl;
-                                    complete_initialization(false);
+                                    win3->complete_initialization(false);
                                 }
                             });
 
@@ -355,7 +359,7 @@ bool NativeWindow::initialize() {
                 );
                 if (FAILED(hr_ctrl)) {
                     std::cerr << "[Kira Error] CreateCoreWebView2Controller call failed, hr=0x" << std::hex << hr_ctrl << std::endl;
-                    complete_initialization(false);
+                    win->complete_initialization(false);
                     return hr_ctrl;
                 }
                 return S_OK;
@@ -364,15 +368,21 @@ bool NativeWindow::initialize() {
 
     if (FAILED(hr)) {
         std::cerr << "[Kira Error] CreateCoreWebView2EnvironmentWithOptions request failed, hr=0x" << std::hex << hr << std::endl;
-        complete_initialization(false);
+        if (win_state_) win_state_->complete_initialization(false);
         return false;
+    }
+
+    // Keep active webview and controller synchronized on NativeWindow instance
+    if (win_state_) {
+        webview_controller_ = win_state_->webview_controller;
+        webview_ = win_state_->webview;
     }
 
     return true;
 }
 
 HRESULT NativeWindow::navigate() {
-    assert(is_ui_thread() && "NativeWindow::navigate must run on UI thread");
+    if (!check_ui_thread()) return E_FAIL;
     if (!webview_) return E_POINTER;
 
     HRESULT hr = S_OK;
@@ -386,7 +396,7 @@ HRESULT NativeWindow::navigate() {
 }
 
 void NativeWindow::resize_webview() {
-    assert(is_ui_thread() && "resize_webview must run on UI thread");
+    if (!check_ui_thread()) return;
     if (webview_controller_ && hwnd_) {
         RECT bounds;
         if (!GetClientRect(hwnd_, &bounds)) {
@@ -401,7 +411,7 @@ void NativeWindow::resize_webview() {
 }
 
 void NativeWindow::show() {
-    assert(is_ui_thread() && "show must run on UI thread");
+    if (!check_ui_thread()) return;
     if (hwnd_) {
         ShowWindow(hwnd_, SW_SHOW);
         UpdateWindow(hwnd_);
@@ -409,14 +419,14 @@ void NativeWindow::show() {
 }
 
 void NativeWindow::hide() {
-    assert(is_ui_thread() && "hide must run on UI thread");
+    if (!check_ui_thread()) return;
     if (hwnd_) {
         ShowWindow(hwnd_, SW_HIDE);
     }
 }
 
 void NativeWindow::post_ui_response(const std::string& response_json) {
-    if (!hwnd_ || !state_ || !state_->alive.load()) return;
+    if (!hwnd_ || !win_state_ || !win_state_->alive.load()) return;
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         response_queue_.push_back(response_json);
@@ -424,6 +434,9 @@ void NativeWindow::post_ui_response(const std::string& response_json) {
     BOOL posted = PostMessage(hwnd_, WM_KIRA_IPC_RESPONSE, 0, 0);
     if (!posted) {
         std::cerr << "[Kira Window Error] PostMessage(WM_KIRA_IPC_RESPONSE) failed, err=" << GetLastError() << std::endl;
+        if (ui_thread_id_ != 0) {
+            PostThreadMessage(ui_thread_id_, WM_KIRA_IPC_RESPONSE, 0, 0);
+        }
     }
 }
 
