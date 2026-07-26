@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kira C++23 Application</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="background-decor">
+        <div class="glow glow-1"></div>
+        <div class="glow glow-2"></div>
+    </div>
+
+    <main class="container">
+        <header class="hero">
+            <div class="logo-badge">
+                <span class="badge-icon">⚡</span>
+                <span>Kira C++23 Engine</span>
+            </div>
+            <h1>Lightweight Native Desktop Framework</h1>
+            <p class="subtitle">Tauri architecture powered by C++23 native IPC & Win32 WebView2</p>
+        </header>
+
+        <section class="card glass">
+            <h2>Interactive IPC Demo</h2>
+            <p class="card-desc">Call native C++ registered functions asynchronously via <code>invoke(command, args)</code> Promise API.</p>
+
+            <div class="form-group">
+                <label for="name-input">Enter your name:</label>
+                <div class="input-wrapper">
+                    <input type="text" id="name-input" placeholder="e.g. Developer" value="Kira Explorer" autocomplete="off" />
+                    <button id="greet-btn" class="btn btn-primary">
+                        <span>Invoke Greet</span>
+                        <span class="btn-spinner hidden"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="output-box" class="output-box hidden">
+                <div class="output-header">
+                    <span class="status-indicator"></span>
+                    <span>Native Response</span>
+                </div>
+                <pre id="output-content"></pre>
+            </div>
+        </section>
+
+        <section class="card glass">
+            <h2>System Diagnostics</h2>
+            <div class="actions">
+                <button id="info-btn" class="btn btn-secondary">Get Engine Info</button>
+            </div>
+            <div id="info-box" class="output-box hidden">
+                <pre id="info-content"></pre>
+            </div>
+        </section>
+
+        <footer>
+            <p>Built with C++23, Win32 API, & Microsoft WebView2</p>
+        </footer>
+    </main>
+
+    <script src="main.js"></script>
+</body>
+</html>

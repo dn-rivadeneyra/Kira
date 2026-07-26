@@ -1,0 +1,33 @@
+# CMake Build Directories
+build/
+bin/
+lib/
+out/
+.cmake/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.ninja
+third_party/*.zip
+
+# Visual Studio / MSVC outputs
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.dir/
+*.log
+*.pdb
+*.obj
+*.idb
+*.ilk
+*.exe
+*.dll
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
